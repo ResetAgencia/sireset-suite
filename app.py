@@ -8,7 +8,7 @@ import streamlit as st
 import pandas as pd
 
 # --- asegurar import de 'core'
-APP_ROOT = Path(_file_).parent.resolve()
+APP_ROOT = Path(__file__).parent.resolve()
 for p in (APP_ROOT, APP_ROOT / "core"):
     sp = str(p)
     if sp not in sys.path:
