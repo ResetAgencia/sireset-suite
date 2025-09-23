@@ -1,0 +1,64 @@
+# pages/00_debug.py
+import os, sys, json
+from pathlib import Path
+import streamlit as st
+
+st.title("🔧 Diagnóstico rápido")
+
+APP_ROOT = Path(__file__).resolve().parents[1]
+st.write("APP_ROOT:", str(APP_ROOT))
+
+# 1) Estructura de carpetas
+core_dir = APP_ROOT / "core"
+assets_dir = APP_ROOT / "assets"
+st.write("Existe core/:", core_dir.exists())
+st.write("Existe assets/:", assets_dir.exists())
+
+st.write("Archivos en core/:", [p.name for p in core_dir.glob("*.py")])
+st.write("Archivos en assets/:", [p.name for p in assets_dir.glob("*")][:20])
+
+# 2) Versión de Python y paquetes críticos
+import platform
+st.write("Python:", sys.version)
+def safe_ver(modname):
+    try:
+        m = __import__(modname)
+        return getattr(m, "__version__", "¿sin __version__?")
+    except Exception as e:
+        return f"ERROR: {e}"
+
+for mod in ["streamlit","pandas","numpy","folium","branca","openpyxl","XlsxWriter"]:
+    st.write(f"{mod}:", safe_ver(mod))
+
+# 3) Import de mougli_core y mapito_core
+try:
+    import core.mougli_core as mc
+    st.success("Import core.mougli_core OK")
+    st.write("Funciones disponibles:", [x for x in dir(mc) if not x.startswith("_")][:50])
+except Exception as e:
+    st.error(f"Fallo import core.mougli_core: {type(e).__name__}: {e}")
+
+try:
+    import core.mapito_core as mapito
+    st.info("Import core.mapito_core OK")
+    st.write("Tiene build_map?:", hasattr(mapito, "build_map"))
+except Exception as e:
+    st.warning(f"Import core.mapito_core falló (esto no rompe Mougli): {type(e).__name__}: {e}")
+
+# 4) Config JSON factores
+cfg_path = core_dir / "factores_config.json"
+st.write("core/factores_config.json existe?:", cfg_path.exists())
+if cfg_path.exists():
+    try:
+        text = cfg_path.read_text(encoding="utf-8")[:1000]
+        st.code(text, language="json")
+    except Exception as e:
+        st.error(f"No puedo leer factores_config.json: {e}")
+
+# 5) Espacio disco (Cloud)
+try:
+    import shutil
+    total, used, free = shutil.disk_usage("/")
+    st.write("Disco - Total/GB:", round(total/1e9,2), "Usado/GB:", round(used/1e9,2), "Libre/GB:", round(free/1e9,2))
+except Exception:
+    pass
