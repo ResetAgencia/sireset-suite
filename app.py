@@ -4,7 +4,12 @@ import streamlit as st
 from pathlib import Path
 
 # --- Módulos de negocio
-from core.mougli_core import procesar_monitor_outview, resumen_mougli
+from core.mougli_core import (
+    procesar_monitor_outview,
+    resumen_mougli,
+    _read_monitor_txt,   # <- corrección: usar el lector real de Monitor
+    _read_out_robusto    # <- ya existía; lo reutilizamos para el resumen
+)
 from core.mapito_core import build_map
 
 # ---------- Config ----------
@@ -49,21 +54,16 @@ if app == "Mougli":
             df_result, xlsx = procesar_monitor_outview(up_monitor, up_out, factores=factores)
             st.success("¡Listo! ✅")
 
-            # --- Resumen “doble”, como en el desktop
+            # --- Resumen “doble” (usando los mismos lectores del core)
             colA, colB = st.columns(2)
             with colA:
                 st.markdown("#### Monitor")
-                # Recargo el monitor solo para resumen local
-                # (sin leer de nuevo archivos; opcional)
-                # Aquí usamos el mismo motor de lectura que usa la función
-                from core.mougli_core import _read_txt_robusto
-                df_m = _read_txt_robusto(up_monitor) if up_monitor else None
-                st.dataframe(resumen_mougli(df_m), use_container_width=True)
+                df_m = _read_monitor_txt(up_monitor) if up_monitor else None
+                st.dataframe(resumen_mougli(df_m, es_monitor=True), use_container_width=True)
             with colB:
                 st.markdown("#### OutView")
-                from core.mougli_core import _read_out_robusto
                 df_o = _read_out_robusto(up_out) if up_out else None
-                st.dataframe(resumen_mougli(df_o), use_container_width=True)
+                st.dataframe(resumen_mougli(df_o, es_monitor=False), use_container_width=True)
 
             # --- Descarga Excel multihoja
             st.download_button(
@@ -73,7 +73,7 @@ if app == "Mougli":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            # Vista rápida del resultado principal (Consolidado si existe)
+            # Vista rápida del resultado principal (Consolidado si existe; si no, Monitor)
             st.markdown("### Vista previa")
             st.dataframe(df_result.head(100), use_container_width=True)
 
