@@ -1,57 +1,46 @@
 # app.py
+# ──────────────────────────────────────────────────────────────────────────────
+# SiReset Suite - App principal
+# ──────────────────────────────────────────────────────────────────────────────
+
 import sys
-import os
 from pathlib import Path
 from io import BytesIO
 import inspect
+import traceback
 
 import streamlit as st
 import pandas as pd
 
-# ───────────────────────────── Bootstrap de imports ─────────────────────────────
-# Asegurar que el directorio del proyecto y ./core estén en sys.path
-try:
-    APP_ROOT = Path(__file__).resolve().parent        # ← ¡Importante! __file__
-except NameError:
-    # En algunos entornos interactivos __file__ no existe
-    APP_ROOT = Path(os.getcwd()).resolve()
-
+# ───────────────────────────── Ajuste de rutas ────────────────────────────────
+APP_ROOT = Path(__file__).parent.resolve()
 for p in (APP_ROOT, APP_ROOT / "core"):
     sp = str(p)
     if sp not in sys.path:
         sys.path.insert(0, sp)
 
-# (opcional) garantizar que core sea paquete
-try:
-    init_file = APP_ROOT / "core" / "__init__.py"
-    if (APP_ROOT / "core").exists() and not init_file.exists():
-        init_file.write_text("", encoding="utf-8")
-except Exception:
-    pass
-
-# ───────────────────────────── Importar mougli_core ─────────────────────────────
+# ───────────────────── Import seguro de core.mougli_core ──────────────────────
 try:
     import core.mougli_core as mc
 except Exception as e:
+    st.set_page_config(page_title="SiReset", layout="wide")
     st.error(
-        "No pude importar `core.mougli_core`. Verifica que exista la carpeta **core/** al lado de `app.py` "
-        "y que dentro esté `mougli_core.py`.\n\n"
-        f"Detalle técnico: {e}"
+        "No pude importar `core.mougli_core`. Verifica que exista la carpeta **core/** "
+        "al lado de `app.py` y que dentro esté `mougli_core.py`."
     )
+    st.code(f"{type(e).__name__}: {e}")
     st.stop()
 
 
 def require_any(preferido: str, *alternativos: str):
     """
-    Devuelve la primera función disponible en core.mougli_core entre el nombre preferido
-    y sus posibles alias. Si no existe, detiene la app con un mensaje claro.
+    Devuelve la primera función disponible del módulo `mc` entre la preferida y sus alias.
+    Corta la ejecución con un mensaje útil si no encuentra ninguna.
     """
     candidatos = (preferido, *alternativos)
     for name in candidatos:
         fn = getattr(mc, name, None)
         if callable(fn):
-            if name != preferido:
-                st.info(f"Usando `{name}()` como alias de `{preferido}()`.")
             return fn
     exports = sorted([x for x in dir(mc) if not x.startswith("_")])
     st.error(
@@ -62,7 +51,7 @@ def require_any(preferido: str, *alternativos: str):
     st.stop()
 
 
-# Resolver funciones/exportaciones de mougli_core
+# Resolver funciones/exportaciones de mougli_core (compatibles con tus versiones)
 procesar_monitor_outview = require_any(
     "procesar_monitor_outview",
     "procesar_monitor_outview_v2",
@@ -78,7 +67,10 @@ save_outview_factor  = require_any("save_outview_factor")
 
 
 def llamar_procesar_monitor_outview(monitor_file, out_file, factores, outview_factor):
-    """Llama a procesar_monitor_outview tolerando firmas distintas (con/sin outview_factor)."""
+    """
+    Llama a `procesar_monitor_outview` tolerando diferencias de firma
+    entre versiones (con / sin parámetro outview_factor).
+    """
     try:
         sig = inspect.signature(procesar_monitor_outview).parameters
         if "outview_factor" in sig:
@@ -88,41 +80,46 @@ def llamar_procesar_monitor_outview(monitor_file, out_file, factores, outview_fa
         else:
             return procesar_monitor_outview(monitor_file, out_file, factores=factores)
     except TypeError:
-        # por si es una firma posicional antigua
+        # Algunos builds antiguos tienen firma posicional
         try:
             return procesar_monitor_outview(monitor_file, out_file, factores, outview_factor)
         except TypeError:
             return procesar_monitor_outview(monitor_file, out_file, factores)
 
 
-# Mapito (opcional)
+# Mapito (opcional). Si no existe, la app sigue corriendo.
 try:
     from core.mapito_core import build_map
 except Exception:
-    build_map = None  # no rompemos Mougli si Mapito no está
+    build_map = None
 
 
-# ───────────────────────────── Config base ─────────────────────────────
+# ───────────────────────────── Config y encabezado ────────────────────────────
 st.set_page_config(page_title="SiReset", layout="wide")
-DATA_DIR = Path("data")
+DATA_DIR = APP_ROOT / "data"
 
-# Encabezado
-st.image("assets/Encabezado.png", use_container_width=True)
+# Encabezado tolerante (no rompe si falta la imagen)
+try:
+    st.image("assets/Encabezado.png", use_container_width=True)
+except Exception:
+    st.markdown("## SiReset Suite")
 
-# Selector de app (solo mostramos Mapito si está disponible)
+
+# ───────────────────────────── Sidebar (selector app) ─────────────────────────
 apps = ["Mougli"]
 if build_map is not None:
     apps.append("Mapito")
 app = st.sidebar.radio("Elige aplicación", apps, index=0)
 
-# ───────────────────────────── Helpers UI ─────────────────────────────
+
+# ───────────────────────────── Helpers de interfaz ────────────────────────────
 BAD_TIPOS = {
     "INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
     "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"
 }
 
 
-def _unique_list_str(series, max_items=50):
+def _unique_list_str(series: pd.Series | None, max_items=50) -> str:
     if series is None:
         return "—"
     vals = (
@@ -138,7 +135,7 @@ def _unique_list_str(series, max_items=50):
     return ", ".join(vals)
 
 
-def _web_resumen_enriquecido(df, *, es_monitor: bool) -> pd.DataFrame:
+def _web_resumen_enriquecido(df: pd.DataFrame | None, *, es_monitor: bool) -> pd.DataFrame:
     base = resumen_mougli(df, es_monitor=es_monitor)
     if base is None or base.empty:
         base = pd.DataFrame([{"Filas": 0, "Rango de fechas": "—", "Marcas / Anunciantes": 0}])
@@ -160,14 +157,15 @@ def _web_resumen_enriquecido(df, *, es_monitor: bool) -> pd.DataFrame:
 
     if extras_rows:
         base_vertical = pd.concat([base_vertical, pd.DataFrame(extras_rows)], ignore_index=True)
-
     return base_vertical
 
 
-def _scan_alertas(df, *, es_monitor: bool):
+def _scan_alertas(df: pd.DataFrame | None, *, es_monitor: bool) -> list[str]:
     if df is None or df.empty:
         return []
     alerts = []
+
+    # 1) TIPO ELEMENTO contiene valores "malos"
     tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
     tipo_col = next((c for c in tipo_cols if c in df.columns), None)
     if tipo_col:
@@ -175,12 +173,15 @@ def _scan_alertas(df, *, es_monitor: bool):
         malos = sorted(set([t for t in tipos.unique() if t in BAD_TIPOS]))
         if malos:
             alerts.append("Se detectaron valores en TIPO ELEMENTO: " + ", ".join(malos))
-    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if (df is not None and "Región" in df.columns) else None)
-    if reg_col and reg_col in df.columns:
+
+    # 2) Región distinta de LIMA
+    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if ("Región" in (df.columns if df is not None else [])) else None)
+    if df is not None and reg_col and reg_col in df.columns:
         regiones = df[reg_col].astype(str).str.upper().str.strip().replace({"NAN": ""}).dropna()
         fuera = sorted(set([r for r in regiones.unique() if r and r != "LIMA"]))
         if fuera:
             alerts.append("Regiones distintas de LIMA detectadas: " + ", ".join(fuera))
+
     return alerts
 
 
@@ -192,6 +193,7 @@ def _clone_for_processing_and_summary(upfile):
     a = BytesIO(data)
     b = BytesIO(data)
     name = getattr(upfile, "name", "")
+    # Preservar nombre cuando sea posible
     try:
         setattr(a, "name", name)
         setattr(b, "name", name)
@@ -200,20 +202,20 @@ def _clone_for_processing_and_summary(upfile):
     return a, b
 
 
-# ───────────────────────────── M O U G L I ─────────────────────────────
+# ──────────────────────────────── M O U G L I ─────────────────────────────────
 if app == "Mougli":
     st.markdown("## Mougli – Monitor & OutView")
 
-    # Factores SOLO visibles en Mougli
-    st.sidebar.markdown("### Factores")
+    # Factores SOLO para Mougli
+    st.sidebar.markdown("### Factores (Monitor/OutView)")
     persist_m = load_monitor_factors()
     persist_o = load_outview_factor()
 
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        f_tv = st.number_input("TV", min_value=0.0, step=0.01, value=float(persist_m.get("TV", 0.26)))
-        f_cable = st.number_input("CABLE", min_value=0.0, step=0.01, value=float(persist_m.get("CABLE", 0.42)))
-        f_radio = st.number_input("RADIO", min_value=0.0, step=0.01, value=float(persist_m.get("RADIO", 0.42)))
+        f_tv    = st.number_input("TV",     min_value=0.0, step=0.01, value=float(persist_m.get("TV", 0.26)))
+        f_cable = st.number_input("CABLE",  min_value=0.0, step=0.01, value=float(persist_m.get("CABLE", 0.42)))
+        f_radio = st.number_input("RADIO",  min_value=0.0, step=0.01, value=float(persist_m.get("RADIO", 0.42)))
     with col2:
         f_revista = st.number_input("REVISTA", min_value=0.0, step=0.01, value=float(persist_m.get("REVISTA", 0.15)))
         f_diarios = st.number_input("DIARIOS", min_value=0.0, step=0.01, value=float(persist_m.get("DIARIOS", 0.15)))
@@ -241,7 +243,7 @@ if app == "Mougli":
     st.write("")
     if st.button("Procesar Mougli", type="primary"):
         try:
-            # Clonar archivos para no perder punteros
+            # Clonar archivos (evita problemas de punteros consumidos)
             mon_proc, mon_sum = _clone_for_processing_and_summary(up_monitor)
             out_proc, out_sum = _clone_for_processing_and_summary(up_out)
 
@@ -276,7 +278,7 @@ if app == "Mougli":
                         df_o = None
                 st.dataframe(_web_resumen_enriquecido(df_o, es_monitor=False), use_container_width=True)
 
-            # Alertas
+            # Alertas amigables
             issues = []
             issues += _scan_alertas(df_m, es_monitor=True)
             issues += _scan_alertas(df_o, es_monitor=False)
@@ -296,13 +298,15 @@ if app == "Mougli":
             st.dataframe(df_result.head(100), use_container_width=True)
 
         except Exception as e:
-            st.error(f"Ocurrió un error procesando: {e}")
+            st.error("Ocurrió un error procesando Mougli.")
+            st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
 
-# ───────────────────────────── M A P I T O ─────────────────────────────
+
+# ───────────────────────────────── M A P I T O ────────────────────────────────
 elif app == "Mapito" and build_map is not None:
     st.markdown("## Mapito – Perú")
 
-    # Controles de estilo (en la barra lateral)
+    # Estilos en la barra lateral (simple y seguro)
     st.sidebar.markdown("### Estilos del mapa")
     color_general = st.sidebar.color_picker("Color general", "#713030")
     color_sel     = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
@@ -322,9 +326,19 @@ elif app == "Mapito" and build_map is not None:
         if seleccion:
             st.caption(f"Elementos mostrados: {len(seleccion)}")
     except Exception as e:
-        st.error(f"No se pudo construir el mapa: {e}")
+        st.error("No se pudo construir el mapa.")
+        st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
 
 else:
     if build_map is None and app == "Mapito":
         st.info("Mapito no está disponible en este entorno.")
 
+
+# ─────────────────────────── Guardarraíles finales ────────────────────────────
+# Si algo se rompe al importar antes de dibujar UI, muestra el traceback
+# en vez del 'Oh no.' de Streamlit.
+try:
+    pass  # todo se ejecuta arriba
+except Exception as e:
+    st.error("Falló la inicialización de la app:")
+    st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
