@@ -29,6 +29,7 @@ def _read_monitor_txt(file) -> pd.DataFrame:
     if file is None:
         return pd.DataFrame()
 
+    # Streamlit UploadedFile tiene .read() y .seek()
     raw = file.read()
     text = _decode_bytes(raw) if isinstance(raw, (bytes, bytearray)) else raw
     lines = text.splitlines()
@@ -86,20 +87,26 @@ def _read_monitor_txt(file) -> pd.DataFrame:
 def _read_out_robusto(file) -> pd.DataFrame:
     if file is None:
         return pd.DataFrame()
-    name = file.name.lower()
+    name = (getattr(file, "name", "") or "").lower()
     try:
         if name.endswith(".csv"):
             try:
+                # primer intento: autodetección
+                file.seek(0)
                 return pd.read_csv(file)
             except UnicodeDecodeError:
                 file.seek(0)
                 return pd.read_csv(file, sep=";", encoding="latin-1")
+        # Excel (xlsx/xls)
+        file.seek(0)
         return pd.read_excel(file)
     except Exception:
-        file.seek(0)
+        # Fallback CSV latino con ;
         try:
+            file.seek(0)
             return pd.read_csv(file, sep=";", encoding="latin-1")
         except Exception:
+            # Último recurso: Excel
             file.seek(0)
             return pd.read_excel(file)
 
@@ -114,6 +121,7 @@ def _aplicar_factores_monitor(df: pd.DataFrame, factores: Dict[str, float]) -> p
     if df.empty or "MEDIO" not in df.columns or "INVERSION" not in df.columns:
         return df
     df = df.copy()
+
     def fx(m):
         m = (str(m) or "").upper().strip()
         mapa = {
@@ -125,6 +133,7 @@ def _aplicar_factores_monitor(df: pd.DataFrame, factores: Dict[str, float]) -> p
         }
         clave = mapa.get(m, None)
         return float(factores.get(clave, 1.0)) if clave else 1.0
+
     df["INVERSION"] = df.apply(lambda r: r["INVERSION"] * fx(r["MEDIO"]), axis=1)
     return df
 
@@ -203,7 +212,7 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float])
         if not df_c.empty:
             df_c.to_excel(w, index=False, sheet_name="Consolidado")
 
-        # Resumen “doble” como el básico
+        # Resumen “doble”
         rm = resumen_mougli(df_m, es_monitor=True);  rm.insert(0, "Fuente", "Monitor")
         ro = resumen_mougli(df_o, es_monitor=False); ro.insert(0, "Fuente", "OutView")
         pd.concat([rm, ro], ignore_index=True).to_excel(w, index=False, sheet_name="Resumen")
@@ -219,4 +228,3 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float])
     xlsx.seek(0)
     df_result = df_c if not df_c.empty else df_m
     return df_result, xlsx
-
