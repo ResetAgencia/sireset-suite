@@ -3,8 +3,16 @@ from __future__ import annotations
 import os, sqlite3, json, base64, hashlib, hmac, time
 from typing import Optional, Tuple, Dict, Any, List
 
-DB_PATH = os.environ.get("SIRESET_DB_PATH", os.path.join(os.path.dirname(__file__), "sireset.db"))
+# UI
+import streamlit as st
 
+# --------- Ruta de la base ---------
+DB_PATH = os.environ.get(
+    "SIRESET_DB_PATH",
+    os.path.join(os.path.dirname(__file__), "sireset.db"),
+)
+
+# --------- Conexión y setup ---------
 def _connect():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
@@ -18,8 +26,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           email TEXT UNIQUE NOT NULL,
-          name TEXT NOT NULL,
-          role TEXT NOT NULL,
+          name  TEXT NOT NULL,
+          role  TEXT NOT NULL,
           pw_hash TEXT NOT NULL,
           active INTEGER NOT NULL DEFAULT 1,
           modules TEXT NOT NULL DEFAULT '[]'
@@ -30,33 +38,33 @@ def init_db():
         CREATE TABLE IF NOT EXISTS modules (
           code TEXT PRIMARY KEY,
           title TEXT NOT NULL,
-          file TEXT,
-          func TEXT,
+          file  TEXT,
+          func  TEXT,
           enabled INTEGER NOT NULL DEFAULT 1
         )
     """)
-    # Tokens de login persistente (URL ?tk=...)
+    # Tokens login persistente
     cur.execute("""
         CREATE TABLE IF NOT EXISTS login_tokens (
           token_hash TEXT PRIMARY KEY,
           user_id INTEGER NOT NULL,
-          expires INTEGER NOT NULL,
-          active INTEGER NOT NULL DEFAULT 1,
+          expires  INTEGER NOT NULL,
+          active   INTEGER NOT NULL DEFAULT 1,
           created_ts INTEGER NOT NULL,
           FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
     con.commit(); con.close()
 
-# ---------- Registro de módulos ----------
 def ensure_builtin_modules():
+    """Registra Mougli y Mapito si no existen."""
     con = _connect(); cur = con.cursor()
     for code, title in [("Mougli", "Mougli"), ("Mapito", "Mapito")]:
         cur.execute("SELECT 1 FROM modules WHERE code=?", (code,))
         if cur.fetchone() is None:
             cur.execute(
                 "INSERT INTO modules(code,title,file,func,enabled) VALUES(?,?,?,?,1)",
-                (code, title, "", "",)
+                (code, title, "", ""),
             )
     con.commit(); con.close()
 
@@ -70,10 +78,16 @@ def list_all_modules(enabled_only: bool=False) -> List[Dict[str, Any]]:
     return [{
         "code": r["code"],
         "title": r["title"],
-        "file": r["file"] or "",
-        "func": r["func"] or "",
+        "file":  r["file"] or "",
+        "func":  r["func"] or "",
         "enabled": bool(r["enabled"]),
     } for r in rows]
+
+def register_module(code: str, title: str, file: str, func: str="render", enabled: bool=True):
+    code = code.strip()
+    if not code or not title:
+        raise ValueError("Código y título son obligatorios.")
+    con=_connect(); cur=_connect().cursor()
 
 def register_module(code: str, title: str, file: str, func: str="render", enabled: bool=True):
     code = code.strip()
@@ -93,11 +107,11 @@ def update_module(code: str, *, title: Optional[str]=None, file: Optional[str]=N
                   func: Optional[str]=None, enabled: Optional[bool]=None):
     con=_connect(); cur=con.cursor()
     sets=[]; vals=[]
-    if title is not None: sets.append("title=?"); vals.append(title)
-    if file  is not None: sets.append("file=?");  vals.append(file)
-    if func  is not None: sets.append("func=?");  vals.append(func)
+    if title   is not None: sets.append("title=?");   vals.append(title)
+    if file    is not None: sets.append("file=?");    vals.append(file)
+    if func    is not None: sets.append("func=?");    vals.append(func)
     if enabled is not None: sets.append("enabled=?"); vals.append(1 if enabled else 0)
-    if not sets: 
+    if not sets:
         con.close(); return
     vals.append(code)
     cur.execute(f"UPDATE modules SET {', '.join(sets)} WHERE code=?", vals)
@@ -108,7 +122,7 @@ def delete_module(code: str):
     cur.execute("DELETE FROM modules WHERE code=?", (code,))
     con.commit(); con.close()
 
-# ---------- Password hashing (PBKDF2-SHA256) ----------
+# --------- Password hashing (PBKDF2-SHA256) ---------
 _PBKDF2_ITERS = 240_000
 
 def _hash_pw(password: str) -> str:
@@ -137,7 +151,7 @@ def _verify_pw(password: str, stored: str) -> bool:
     except Exception:
         return False
 
-# ---------- CRUD usuarios ----------
+# --------- CRUD usuarios ---------
 def admin_exists() -> bool:
     con=_connect(); cur=con.cursor()
     cur.execute("SELECT 1 FROM users WHERE role='admin' LIMIT 1")
@@ -220,7 +234,7 @@ def authenticate(email: str, pwd: str) -> Optional[Dict[str, Any]]:
     if not _verify_pw(pwd, r["pw_hash"]): return None
     return _row_to_user(r)
 
-# ---------- Tokens persistentes (magic link con ?tk=...) ----------
+# --------- Tokens persistentes (magic link con ?tk=...) ---------
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -267,7 +281,112 @@ def revoke_all_tokens(user_id: int):
     cur.execute("UPDATE login_tokens SET active=0 WHERE user_id=?", (user_id,))
     con.commit(); con.close()
 
-# al final de auth.py
-login_form = sign_in   # o login, según cómo se llame en tu auth
-login_ui   = login_form
+# --------- Helpers de sesión/UI ---------
+def _get_query_params():
+    try:
+        return dict(st.query_params)
+    except Exception:
+        return st.experimental_get_query_params()
 
+def _set_query_params(**kwargs):
+    try:
+        st.query_params.clear()
+        for k, v in kwargs.items():
+            if v is None:
+                continue
+            st.query_params[k] = v
+    except Exception:
+        st.experimental_set_query_params(**{k: v for k, v in kwargs.items() if v is not None})
+
+def _set_user(u: Optional[Dict[str, Any]]):
+    st.session_state["user"] = u
+
+def current_user() -> Optional[Dict[str, Any]]:
+    return st.session_state.get("user")
+
+def user_has_module(user: Dict[str, Any] | None, code: str) -> bool:
+    if not user: return False
+    if user.get("role") == "admin":
+        return True
+    return code in (user.get("modules") or [])
+
+def _bootstrap_if_needed():
+    """Crea admin si la BD está vacía."""
+    init_db()
+    ensure_builtin_modules()
+    if not admin_exists():
+        st.info("No hay administrador. Crea el primero.")
+        with st.form("create_admin", clear_on_submit=False):
+            email = st.text_input("Email (admin)", "")
+            name  = st.text_input("Nombre", "")
+            pwd   = st.text_input("Contraseña", type="password")
+            ok = st.form_submit_button("Crear administrador")
+        if ok:
+            if not email or not name or not pwd:
+                st.error("Completa todos los campos.")
+            else:
+                create_user(email=email, name=name, role="admin", pwd=pwd, active=True)
+                st.success("Administrador creado. Ahora puedes iniciar sesión.")
+        st.stop()
+
+def login_ui():
+    """Dibuja el formulario de login (incluye bootstrap de admin)."""
+    _bootstrap_if_needed()
+
+    # Auto-login por token en URL
+    q = _get_query_params()
+    token = q.get("tk") or q.get("token")
+    if isinstance(token, list): token = token[0] if token else None
+    if token and not current_user():
+        u = user_from_token(token)
+        if u:
+            _set_user(u)
+            st.success(f"Autenticado como {u['name']}")
+            return
+
+    u = current_user()
+    if u:
+        st.success(f"Sesión iniciada: {u['name']} ({u['email']}) — rol: {u['role']}")
+        return
+
+    st.subheader("Iniciar sesión")
+    with st.form("login_form", clear_on_submit=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            email = st.text_input("Email")
+        with col2:
+            pwd = st.text_input("Contraseña", type="password")
+        remember = st.checkbox("Recordarme (enlace con token)")
+        submit = st.form_submit_button("Entrar")
+
+    if submit:
+        if not email or not pwd:
+            st.error("Ingresa email y contraseña.")
+            return
+        authu = authenticate(email, pwd)
+        if not authu:
+            st.error("Credenciales inválidas o usuario inactivo.")
+            return
+        _set_user(authu)
+        st.success(f"Bienvenido, {authu['name']}")
+
+        if remember:
+            # Necesitamos el id del usuario para crear token
+            res = find_user_by_email(email)
+            if res:
+                uid, _ = res
+                raw = create_login_token(uid)
+                # Mostrar enlace con ?tk=
+                _set_query_params(tk=raw)
+                st.info("Tu enlace persistente quedó en la URL (parámetro tk). Guárdalo como marcador.")
+
+def logout_button(label: str="Cerrar sesión"):
+    """Muestra un botón de logout si hay sesión."""
+    u = current_user()
+    if not u:
+        return
+    if st.button(label):
+        _set_user(None)
+        # Limpia token de la URL
+        _set_query_params()
+        st.experimental_rerun()
