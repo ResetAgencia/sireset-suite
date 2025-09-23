@@ -265,7 +265,19 @@ if app == "Mougli":
 elif app == "Mapito" and build_map is not None:
     st.markdown("## Mapito – Perú")
 
-    # ── Carga rápida de catálogos para las listas jerárquicas
+    # ───────────────── Sidebar: estilos/visibilidad (colores aquí)
+    st.sidebar.markdown("### Estilos del mapa")
+    color_general = st.sidebar.color_picker("Color general", "#713030")
+    color_sel     = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
+    color_borde   = st.sidebar.color_picker("Color de borde", "#000000")
+    color_fondo   = st.sidebar.color_picker("Color de fondo del mapa", "#CAE3EC")
+    show_borders  = st.sidebar.checkbox("Mostrar bordes", value=True)
+    show_basemap  = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
+
+    # ───────────────── Cargar catálogos (regiones/provincias/distritos)
+    import json
+    DATA_DIR = Path("data")
+
     def _read_fc(p: Path) -> dict:
         return json.loads((DATA_DIR / p).read_text(encoding="utf-8"))
 
@@ -280,39 +292,41 @@ elif app == "Mapito" and build_map is not None:
         for f in gj3["features"]
     ]
 
-    # ── Fila 1: Selectores jerárquicos
-    with st.container():
-        c1, c2, c3, c4 = st.columns([1.1, 1.4, 1.8, 1.2])
-        with c1:
-            sel_reg = st.multiselect("Regiones", regiones, default=[])
-        with c2:
-            prov_disp = sorted({p for p in prov_all if (not sel_reg) or p[0] in sel_reg})
-            sel_prov = st.multiselect("Provincias", prov_disp, format_func=lambda t: f"{t[1]} ({t[0]})", default=[])
-        with c3:
-            if sel_prov:
-                prov_set = set(sel_prov)
-                dist_disp = sorted({d for d in dist_all if (d[0], d[1]) in prov_set})
-            elif sel_reg:
-                reg_set = set(sel_reg)
-                dist_disp = sorted({d for d in dist_all if d[0] in reg_set})
-            else:
-                dist_disp = []
-            sel_dist = st.multiselect("Distritos", dist_disp, format_func=lambda t: f"{t[2]} - {t[1]} ({t[0]})", default=[])
-        with c4:
-            ZONAS_LIMA = {
-                "Norte": ["Ancón", "Santa Rosa", "Puente Piedra", "Comas", "Carabayllo",
-                          "Independencia", "San Martín de Porres", "Los Olivos"],
-                "Centro": ["Lima", "Breña", "Lince", "Jesús María", "La Victoria",
-                           "Pueblo Libre", "Magdalena del Mar", "San Miguel"],
-                "Este": ["San Juan de Lurigancho", "Ate", "Santa Anita", "El Agustino",
-                         "La Molina", "Chaclacayo", "Cieneguilla", "Lurigancho-Chosica"],
-                "Sur": ["San Juan de Miraflores", "Villa María del Triunfo", "Villa El Salvador",
-                        "Pachacámac", "Lurín", "Punta Hermosa", "Punta Negra", "San Bartolo",
-                        "Pucusana", "Santa María del Mar", "Chorrillos"],
-                "Callao": ["Callao", "Bellavista", "Carmen de la Legua-Reynoso",
-                           "La Perla", "La Punta", "Ventanilla", "Mi Perú"],
-            }
-            zonas_sel = st.multiselect("Zonas de Lima", list(ZONAS_LIMA.keys()), default=[])
+    # ───────────────── Filtros arriba del mapa
+    c1, c2, c3, c4 = st.columns([1.1, 1.4, 1.8, 1.2])
+    with c1:
+        sel_reg = st.multiselect("Regiones", regiones, default=[])
+    with c2:
+        prov_disp = sorted({p for p in prov_all if (not sel_reg) or p[0] in sel_reg})
+        sel_prov = st.multiselect("Provincias", prov_disp, format_func=lambda t: f"{t[1]} ({t[0]})", default=[])
+    with c3:
+        if sel_prov:
+            prov_set = set(sel_prov)
+            dist_disp = sorted({d for d in dist_all if (d[0], d[1]) in prov_set})
+        elif sel_reg:
+            reg_set = set(sel_reg)
+            dist_disp = sorted({d for d in dist_all if d[0] in reg_set})
+        else:
+            dist_disp = []
+        sel_dist = st.multiselect("Distritos", dist_disp, format_func=lambda t: f"{t[2]} - {t[1]} ({t[0]})", default=[])
+    with c4:
+        ZONAS_LIMA = {
+            "Norte": ["Ancón","Santa Rosa","Puente Piedra","Comas","Carabayllo",
+                      "Independencia","San Martín de Porres","Los Olivos"],
+            "Centro": ["Lima","Breña","Lince","Jesús María","La Victoria",
+                       "Pueblo Libre","Magdalena del Mar","San Miguel"],
+            "Este": ["San Juan de Lurigancho","Ate","Santa Anita","El Agustino",
+                     "La Molina","Chaclacayo","Cieneguilla","Lurigancho-Chosica"],
+            "Sur": ["San Juan de Miraflores","Villa María del Triunfo","Villa El Salvador",
+                    "Pachacámac","Lurín","Punta Hermosa","Punta Negra","San Bartolo",
+                    "Pucusana","Santa María del Mar","Chorrillos"],
+            "Callao": ["Callao","Bellavista","Carmen de la Legua-Reynoso","La Perla",
+                       "La Punta","Ventanilla","Mi Perú"],
+        }
+        zonas_sel = st.multiselect("Zonas de Lima", list(ZONAS_LIMA.keys()), default=[])
+
+    # Ajustar vista arriba (se queda aquí, no en la barra)
+    fit_selected = st.checkbox("Ajustar vista a lo seleccionado", value=True)
 
     # Expandir zonas a distritos (Lima/Callao)
     if zonas_sel:
@@ -328,24 +342,7 @@ elif app == "Mapito" and build_map is not None:
                     extra.append(("Callao", "Callao", d))
         sel_dist = sorted(set(list(sel_dist) + extra))
 
-    # ── Fila 2: Estilos y opciones de vista
-    with st.container():
-        s1, s2, s3, s4, s5 = st.columns([1.0, 1.0, 1.0, 1.0, 1.0])
-        with s1:
-            color_general = st.color_picker("Color general", "#713030")
-        with s2:
-            color_sel = st.color_picker("Color seleccionado", "#5F48C6")
-        with s3:
-            color_borde = st.color_picker("Color de borde", "#000000")
-        with s4:
-            color_fondo = st.color_picker("Color de fondo del mapa", "#CAE3EC")
-        with s5:
-            fit_selected = st.checkbox("Ajustar vista a lo seleccionado", value=True)
-
-    # (los controles tipo OSM/LayerControl siguen saliendo DENTRO del mapa)
-    show_basemap = True
-    grosor = 0.8
-
+    # Normalizar selecciones para build_map
     def low(s): return (s or "").strip().lower()
     selections = {
         "regions":   [low(r) for r in sel_reg],
@@ -353,21 +350,17 @@ elif app == "Mapito" and build_map is not None:
         "districts": [(low(a), low(b), low(c)) for (a, b, c) in sel_dist],
     }
 
+    # ───────────────── Construir mapa
     try:
         html, meta = build_map(
             data_dir=DATA_DIR,
             colores={"fill": color_general, "selected": color_sel, "border": color_borde},
-            style={"weight": grosor, "show_borders": True, "show_basemap": show_basemap},
+            style={"weight": 0.8, "show_borders": show_borders, "show_basemap": show_basemap},
             selections=selections,
             fit_selected=fit_selected,
-            background_color=color_fondo,
+            background_color=color_fondo,   # <- color de fondo desde la sidebar
         )
         st.components.v1.html(html, height=700, scrolling=False)
-        st.caption(f"Mostrando: general={meta.get('n_regions',0)}  ·  destacados={meta.get('n_selected',0)}")
+        st.caption(f"Mostrando: general={meta.get('n_regions',0)} · destacados={meta.get('n_selected',0)}")
     except Exception as e:
         st.error(f"No se pudo construir el mapa: {e}")
-
-else:
-    if build_map is None and app == "Mapito":
-        st.info("Mapito no está disponible en este entorno.")
-
