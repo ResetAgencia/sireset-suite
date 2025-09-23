@@ -1,12 +1,13 @@
-﻿streamlit
+streamlit
 pandas
 numpy
 folium
 branca
 jinja2
-pillow
 pyarrow
 openpyxl
 xlsxwriter
 gitpython
 watchdog
+matplotlib>=3.8
+pillow>=10
