@@ -3,13 +3,12 @@ import sys
 from pathlib import Path
 from io import BytesIO
 import inspect
-import json
 
 import streamlit as st
 import pandas as pd
 
 # --- asegurar import de 'core'
-APP_ROOT = Path(__file__).parent.resolve()
+APP_ROOT = Path(_file_).parent.resolve()
 for p in (APP_ROOT, APP_ROOT / "core"):
     sp = str(p)
     if sp not in sys.path:
@@ -20,23 +19,24 @@ try:
     import core.mougli_core as mc
 except Exception as e:
     st.error(
-        "No pude importar `core.mougli_core`. Verifica que exista la carpeta **core/** al lado de `app.py` "
-        "y que dentro esté `mougli_core.py`.\n\n"
+        "No pude importar core.mougli_core. Verifica que exista la carpeta *core/* al lado de app.py "
+        "y que dentro esté mougli_core.py.\n\n"
         f"Detalle técnico: {e}"
     )
     st.stop()
 
 def require_any(preferido: str, *alternativos: str):
+    """Devuelve la primera función disponible entre preferido y alias."""
     candidatos = (preferido, *alternativos)
     for name in candidatos:
         fn = getattr(mc, name, None)
         if callable(fn):
             if name != preferido:
-                st.info(f"Usando `{name}()` como alias de `{preferido}()`.")
+                st.info(f"Usando {name}() como alias de {preferido}().")
             return fn
     exports = sorted([x for x in dir(mc) if not x.startswith("_")])
     st.error(
-        f"No encontré la función **{preferido}** en `core/mougli_core.py`.\n\n"
+        f"No encontré la función *{preferido}* en core/mougli_core.py.\n\n"
         f"Alias probados: {', '.join(alternativos) or '—'}\n\n"
         f"Funciones visibles en el módulo: {', '.join(exports) or '—'}"
     )
@@ -57,6 +57,7 @@ load_outview_factor  = require_any("load_outview_factor")
 save_outview_factor  = require_any("save_outview_factor")
 
 def llamar_procesar_monitor_outview(monitor_file, out_file, factores, outview_factor):
+    """Llama a procesar_monitor_outview tolerando firmas distintas."""
     try:
         sig = inspect.signature(procesar_monitor_outview).parameters
         if "outview_factor" in sig:
@@ -90,7 +91,7 @@ if build_map is not None:
     apps.append("Mapito")
 app = st.sidebar.radio("Elige aplicación", apps, index=0)
 
-# ---------- Sidebar: Factores SOLO en Mougli ----------
+# ---------- Sidebar: Factores SOLO para Mougli ----------
 if app == "Mougli":
     st.sidebar.markdown("### Factores")
     persist_m = load_monitor_factors()
@@ -112,8 +113,11 @@ if app == "Mougli":
         save_monitor_factors(factores)
         save_outview_factor(out_factor)
         st.sidebar.success("Factores guardados.")
+else:
+    # Valores placeholder para llamadas tipadas (no se usan en Mapito)
+    factores, out_factor = {}, 0.0
 
-# ---------- Helpers UI Mougli ----------
+# ---------- Helpers UI ----------
 BAD_TIPOS = {
     "INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
     "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"
@@ -179,6 +183,7 @@ def _scan_alertas(df, *, es_monitor: bool):
     return alerts
 
 def _clone_for_processing_and_summary(upfile):
+    """Duplica el UploadedFile en dos BytesIO (para procesar y para resumen)."""
     if upfile is None:
         return None, None
     data = upfile.getvalue()
@@ -210,15 +215,18 @@ if app == "Mougli":
     st.write("")
     if st.button("Procesar Mougli", type="primary"):
         try:
+            # Clonar archivos para no perder el puntero
             mon_proc, mon_sum = _clone_for_processing_and_summary(up_monitor)
             out_proc, out_sum = _clone_for_processing_and_summary(up_out)
 
+            # Procesamiento principal (firma tolerante)
             df_result, xlsx = llamar_procesar_monitor_outview(
-                mon_proc, out_proc, factores=load_monitor_factors(), outview_factor=load_outview_factor()
+                mon_proc, out_proc, factores=factores, outview_factor=out_factor
             )
 
             st.success("¡Listo! ✅")
 
+            # Resúmenes enriquecidos (en pantalla)
             colA, colB = st.columns(2)
             with colA:
                 st.markdown("#### Monitor")
@@ -242,12 +250,14 @@ if app == "Mougli":
                         df_o = None
                 st.dataframe(_web_resumen_enriquecido(df_o, es_monitor=False), use_container_width=True)
 
+            # Alertas
             issues = []
             issues += _scan_alertas(df_m, es_monitor=True)
             issues += _scan_alertas(df_o, es_monitor=False)
             if issues:
-                st.warning("⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues))
+                st.warning("⚠️ *Revisión sugerida antes de exportar*:\n\n- " + "\n- ".join(issues))
 
+            # Descarga Excel
             st.download_button(
                 "Descargar Excel",
                 data=xlsx.getvalue(),
@@ -255,6 +265,7 @@ if app == "Mougli":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
+            # Vista previa
             st.markdown("### Vista previa")
             st.dataframe(df_result.head(100), use_container_width=True)
 
@@ -265,102 +276,33 @@ if app == "Mougli":
 elif app == "Mapito" and build_map is not None:
     st.markdown("## Mapito – Perú")
 
-    # ───────────────── Sidebar: estilos/visibilidad (colores aquí)
+    # Estilos de mapa (incluye color de fondo)
     st.sidebar.markdown("### Estilos del mapa")
     color_general = st.sidebar.color_picker("Color general", "#713030")
-    color_sel     = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
-    color_borde   = st.sidebar.color_picker("Color de borde", "#000000")
-    color_fondo   = st.sidebar.color_picker("Color de fondo del mapa", "#CAE3EC")
-    show_borders  = st.sidebar.checkbox("Mostrar bordes", value=True)
-    show_basemap  = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
+    color_sel = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
+    color_borde = st.sidebar.color_picker("Color de borde", "#000000")
+    color_fondo = st.sidebar.color_picker("Color de fondo del mapa", "#A9D3DF")  # NUEVO
+    grosor = st.sidebar.slider("Grosor de borde", 0.1, 2.0, 0.8, 0.05)
+    show_borders = st.sidebar.checkbox("Mostrar bordes", value=True)
+    show_basemap = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
 
-    # ───────────────── Cargar catálogos (regiones/provincias/distritos)
-    import json
-    DATA_DIR = Path("data")
-
-    def _read_fc(p: Path) -> dict:
-        return json.loads((DATA_DIR / p).read_text(encoding="utf-8"))
-
-    gj1 = _read_fc(Path("gadm41_PER_1.json"))  # regiones
-    gj2 = _read_fc(Path("gadm41_PER_2.json"))  # provincias
-    gj3 = _read_fc(Path("gadm41_PER_3.json"))  # distritos
-
-    regiones = sorted({f["properties"]["NAME_1"] for f in gj1["features"]})
-    prov_all = [(f["properties"]["NAME_1"], f["properties"]["NAME_2"]) for f in gj2["features"]]
-    dist_all = [
-        (f["properties"]["NAME_1"], f["properties"]["NAME_2"], f["properties"]["NAME_3"])
-        for f in gj3["features"]
-    ]
-
-    # ───────────────── Filtros arriba del mapa
-    c1, c2, c3, c4 = st.columns([1.1, 1.4, 1.8, 1.2])
-    with c1:
-        sel_reg = st.multiselect("Regiones", regiones, default=[])
-    with c2:
-        prov_disp = sorted({p for p in prov_all if (not sel_reg) or p[0] in sel_reg})
-        sel_prov = st.multiselect("Provincias", prov_disp, format_func=lambda t: f"{t[1]} ({t[0]})", default=[])
-    with c3:
-        if sel_prov:
-            prov_set = set(sel_prov)
-            dist_disp = sorted({d for d in dist_all if (d[0], d[1]) in prov_set})
-        elif sel_reg:
-            reg_set = set(sel_reg)
-            dist_disp = sorted({d for d in dist_all if d[0] in reg_set})
-        else:
-            dist_disp = []
-        sel_dist = st.multiselect("Distritos", dist_disp, format_func=lambda t: f"{t[2]} - {t[1]} ({t[0]})", default=[])
-    with c4:
-        ZONAS_LIMA = {
-            "Norte": ["Ancón","Santa Rosa","Puente Piedra","Comas","Carabayllo",
-                      "Independencia","San Martín de Porres","Los Olivos"],
-            "Centro": ["Lima","Breña","Lince","Jesús María","La Victoria",
-                       "Pueblo Libre","Magdalena del Mar","San Miguel"],
-            "Este": ["San Juan de Lurigancho","Ate","Santa Anita","El Agustino",
-                     "La Molina","Chaclacayo","Cieneguilla","Lurigancho-Chosica"],
-            "Sur": ["San Juan de Miraflores","Villa María del Triunfo","Villa El Salvador",
-                    "Pachacámac","Lurín","Punta Hermosa","Punta Negra","San Bartolo",
-                    "Pucusana","Santa María del Mar","Chorrillos"],
-            "Callao": ["Callao","Bellavista","Carmen de la Legua-Reynoso","La Perla",
-                       "La Punta","Ventanilla","Mi Perú"],
-        }
-        zonas_sel = st.multiselect("Zonas de Lima", list(ZONAS_LIMA.keys()), default=[])
-
-    # Ajustar vista arriba (se queda aquí, no en la barra)
-    fit_selected = st.checkbox("Ajustar vista a lo seleccionado", value=True)
-
-    # Expandir zonas a distritos (Lima/Callao)
-    if zonas_sel:
-        dist_lookup = set((d[0].lower(), d[1].lower(), d[2].lower()) for d in dist_all)
-        extra = []
-        for z in zonas_sel:
-            for d in ZONAS_LIMA.get(z, []):
-                k1 = ("lima", "lima", d.lower())
-                k2 = ("callao", "callao", d.lower())
-                if k1 in dist_lookup:
-                    extra.append(("Lima", "Lima", d))
-                if k2 in dist_lookup:
-                    extra.append(("Callao", "Callao", d))
-        sel_dist = sorted(set(list(sel_dist) + extra))
-
-    # Normalizar selecciones para build_map
-    def low(s): return (s or "").strip().lower()
-    selections = {
-        "regions":   [low(r) for r in sel_reg],
-        "provinces": [(low(a), low(b)) for (a, b) in sel_prov],
-        "districts": [(low(a), low(b), low(c)) for (a, b, c) in sel_dist],
-    }
-
-    # ───────────────── Construir mapa
     try:
-        html, meta = build_map(
+        html, seleccion = build_map(
             data_dir=DATA_DIR,
+            nivel="regiones",
             colores={"fill": color_general, "selected": color_sel, "border": color_borde},
-            style={"weight": 0.8, "show_borders": show_borders, "show_basemap": show_basemap},
-            selections=selections,
-            fit_selected=fit_selected,
-            background_color=color_fondo,   # <- color de fondo desde la sidebar
+            style={
+                "weight": grosor,
+                "show_borders": show_borders,
+                "show_basemap": show_basemap,
+                "bg_color": color_fondo,       # pasa el color de fondo
+            },
         )
         st.components.v1.html(html, height=700, scrolling=False)
-        st.caption(f"Mostrando: general={meta.get('n_regions',0)} · destacados={meta.get('n_selected',0)}")
+        if seleccion:
+            st.caption(f"Elementos mostrados: {len(seleccion)}")
     except Exception as e:
         st.error(f"No se pudo construir el mapa: {e}")
+else:
+    if build_map is None and app == "Mapito":
+        st.info("Mapito no está disponible en este entorno.")
