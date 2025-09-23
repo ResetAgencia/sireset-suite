@@ -13,6 +13,18 @@ from typing import Optional, Tuple, Dict, Any, List
 import streamlit as st
 
 
+# =========================== Util: rerun compatible ===========================
+def _safe_rerun():
+    """Llama a st.rerun() y cae a experimental_rerun en versiones antiguas."""
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()  # fallback para Streamlit antiguos
+        except Exception:
+            pass
+
+
 # =========================== Configuración DB ===========================
 
 DB_PATH = os.environ.get(
@@ -93,10 +105,10 @@ def list_all_modules(enabled_only: bool = False) -> List[Dict[str, Any]]:
     rows = cur.fetchall()
     con.close()
     return [{
-        "code":   r["code"],
-        "title":  r["title"],
-        "file":   r["file"] or "",
-        "func":   r["func"] or "",
+        "code":    r["code"],
+        "title":   r["title"],
+        "file":    r["file"] or "",
+        "func":    r["func"] or "",
         "enabled": bool(r["enabled"]),
     } for r in rows]
 
@@ -298,7 +310,7 @@ def _get_query_params() -> Dict[str, Any]:
         # Streamlit 1.31+
         return dict(st.query_params)
     except Exception:
-        # Compatibilidad
+        # Compatibilidad con versiones anteriores
         return st.experimental_get_query_params()
 
 def _set_query_params(**kwargs):
@@ -350,7 +362,7 @@ def login_ui():
     """Dibuja el formulario de login y resuelve token persistente en URL."""
     _bootstrap_if_needed()
 
-    # Auto-login por token ?tk=
+    # Auto-login por token ?tk=...
     q = _get_query_params()
     token = q.get("tk") or q.get("token")
     if isinstance(token, list):
@@ -405,5 +417,5 @@ def logout_button(label: str = "Cerrar sesión"):
     if st.button(label):
         _set_user(None)
         _set_query_params()   # limpia parámetros (como tk)
-        st.experimental_rerun()
+        _safe_rerun()
 
