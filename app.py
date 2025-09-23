@@ -9,12 +9,12 @@ from core.mapito_core import build_map
 
 # ---------- Config ----------
 st.set_page_config(page_title="SiReset", layout="wide")
-DATA_DIR = Path("data")  # carpeta base para geojson y auxiliares (Mapito)
+DATA_DIR = Path("data")
 
 # ---------- Encabezado ----------
 st.image("assets/Encabezado.png", use_container_width=True)
 
-# ---------- Sidebar: selector de aplicación ----------
+# ---------- Selector de app ----------
 app = st.sidebar.radio("Elige aplicación", ["Mougli", "Mapito"], index=0)
 
 # =============== M O U G L I ===============
@@ -22,7 +22,6 @@ if app == "Mougli":
     st.markdown("## Mougli – Monitor & OutView")
 
     colL, colR = st.columns(2)
-
     with colL:
         st.caption("Sube Monitor (.txt)")
         up_monitor = st.file_uploader(
@@ -41,35 +40,42 @@ if app == "Mougli":
     f_radio = st.sidebar.number_input("RADIO", min_value=0.0, step=0.01, value=0.42)
     f_revista = st.sidebar.number_input("REVISTA", min_value=0.0, step=0.01, value=0.15)
     f_diarios = st.sidebar.number_input("DIARIOS", min_value=0.0, step=0.01, value=0.15)
-
-    factores = {
-        "TV": f_tv,
-        "CABLE": f_cable,
-        "RADIO": f_radio,
-        "REVISTA": f_revista,
-        "DIARIOS": f_diarios,
-    }
+    factores = {"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios}
 
     st.write("")
-    if st.button("Procesar Mougli", type="primary", use_container_width=False):
+    btn = st.button("Procesar Mougli", type="primary")
+    if btn:
         try:
-            df, xlsx = procesar_monitor_outview(
-                up_monitor, up_out, factores=factores
-            )
+            df_result, xlsx = procesar_monitor_outview(up_monitor, up_out, factores=factores)
             st.success("¡Listo! ✅")
 
-            # Descarga Excel (si se generó)
-            if xlsx is not None:
-                st.download_button(
-                    "Descargar Excel",
-                    data=xlsx.getvalue(),
-                    file_name="mougli_resultado.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+            # --- Resumen “doble”, como en el desktop
+            colA, colB = st.columns(2)
+            with colA:
+                st.markdown("#### Monitor")
+                # Recargo el monitor solo para resumen local
+                # (sin leer de nuevo archivos; opcional)
+                # Aquí usamos el mismo motor de lectura que usa la función
+                from core.mougli_core import _read_txt_robusto
+                df_m = _read_txt_robusto(up_monitor) if up_monitor else None
+                st.dataframe(resumen_mougli(df_m), use_container_width=True)
+            with colB:
+                st.markdown("#### OutView")
+                from core.mougli_core import _read_out_robusto
+                df_o = _read_out_robusto(up_out) if up_out else None
+                st.dataframe(resumen_mougli(df_o), use_container_width=True)
 
-            # Resumen bonito
-            st.markdown("### Resumen")
-            st.dataframe(resumen_mougli(df), use_container_width=True)
+            # --- Descarga Excel multihoja
+            st.download_button(
+                "Descargar Excel",
+                data=xlsx.getvalue(),
+                file_name="SiReset_Mougli.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            # Vista rápida del resultado principal (Consolidado si existe)
+            st.markdown("### Vista previa")
+            st.dataframe(df_result.head(100), use_container_width=True)
 
         except Exception as e:
             st.error(f"Ocurrió un error procesando: {e}")
@@ -78,35 +84,24 @@ if app == "Mougli":
 else:
     st.markdown("## Mapito – Perú")
 
-    # Controles de estilo SOLO Mapito
     st.sidebar.markdown("### Estilos del mapa")
     color_general = st.sidebar.color_picker("Color general", "#713030")
     color_sel = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
     color_borde = st.sidebar.color_picker("Color de borde", "#000000")
     grosor = st.sidebar.slider("Grosor de borde", 0.1, 2.0, 0.8, 0.05)
-
     show_borders = st.sidebar.checkbox("Mostrar bordes", value=True)
     show_basemap = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
 
-    # Construye el mapa (usa GeoJSON locales dentro de data/peru)
     try:
         html, seleccion = build_map(
             data_dir=DATA_DIR,
             nivel="regiones",
-            colores={
-                "fill": color_general,
-                "selected": color_sel,
-                "border": color_borde,
-            },
-            style={
-                "weight": grosor,
-                "show_borders": show_borders,
-                "show_basemap": show_basemap,
-            },
+            colores={"fill": color_general, "selected": color_sel, "border": color_borde},
+            style={"weight": grosor, "show_borders": show_borders, "show_basemap": show_basemap},
         )
         st.components.v1.html(html, height=700, scrolling=False)
         if seleccion:
             st.caption(f"Elementos mostrados: {len(seleccion)}")
-
     except Exception as e:
         st.error(f"No se pudo construir el mapa: {e}")
+
