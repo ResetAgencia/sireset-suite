@@ -12,7 +12,9 @@ from core.mougli_core import (
     load_outview_factor,
     save_outview_factor,
 )
-from core.mapito_core import build_map  # si no usas Mapito, puedes comentar esta línea
+
+# Si no usas Mapito, puedes comentar esta import y la rama "Mapito"
+from core.mapito_core import build_map
 
 # ---------- Config ----------
 st.set_page_config(page_title="SiReset", layout="wide")
@@ -46,6 +48,89 @@ if st.sidebar.button("💾 Guardar factores"):
     save_outview_factor(out_factor)
     st.sidebar.success("Factores guardados.")
 
+# ---------- Helpers UI ----------
+BAD_TIPOS = {
+    "INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
+    "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"
+}
+
+def _unique_list_str(series, max_items=50):
+    if series is None:
+        return "—"
+    vals = (
+        series.astype(str)
+        .str.strip()
+        .replace({"nan": ""})
+        .dropna()
+        .loc[lambda s: s.str.len() > 0]
+        .unique()
+        .tolist()
+    )
+    if not vals:
+        return "—"
+    vals = sorted(set(vals))
+    if len(vals) > max_items:
+        return ", ".join(vals[:max_items]) + f" … (+{len(vals)-max_items} más)"
+    return ", ".join(vals)
+
+def _web_resumen_enriquecido(df, *, es_monitor: bool):
+    if df is None or df.empty:
+        return resumen_mougli(df, es_monitor=es_monitor)
+    # Base
+    base = resumen_mougli(df, es_monitor=es_monitor).copy()
+    # Extras pedidas
+    cat_col = "CATEGORIA" if es_monitor else ("Categoría" if "Categoría" in df.columns else None)
+    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if "Región" in df.columns else None)
+    tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
+    tipo_col = next((c for c in tipo_cols if c in df.columns), None)
+
+    # Armar fila única con strings listados
+    extras = {}
+    if cat_col:
+        extras["Categorías (únicas)"] = _unique_list_str(df[cat_col])
+    if reg_col:
+        extras["Regiones (únicas)"] = _unique_list_str(df[reg_col])
+    if tipo_col:
+        extras["Tipos de elemento (únicos)"] = _unique_list_str(df[tipo_col])
+
+    for k, v in extras.items():
+        base[k] = v
+    return base
+
+def _scan_alertas(df, *, es_monitor: bool):
+    """
+    Devuelve lista de strings con alertas encontradas en un df.
+    """
+    if df is None or df.empty:
+        return []
+
+    alerts = []
+
+    # 1) TIPO ELEMENTO contiene bad values
+    tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
+    tipo_col = next((c for c in tipo_cols if c in df.columns), None)
+    if tipo_col:
+        tipos = (
+            df[tipo_col].astype(str).str.upper().str.strip()
+            .replace({"NAN": ""}).dropna()
+        )
+        malos = sorted(set([t for t in tipos.unique() if t in BAD_TIPOS]))
+        if malos:
+            alerts.append("Se detectaron valores en TIPO ELEMENTO: " + ", ".join(malos))
+
+    # 2) Región distinta de LIMA
+    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if "Región" in df.columns else None)
+    if reg_col and reg_col in df.columns:
+        regiones = (
+            df[reg_col].astype(str).str.upper().str.strip()
+            .replace({"NAN": ""}).dropna()
+        )
+        fuera = sorted(set([r for r in regiones.unique() if r and r != "LIMA"]))
+        if fuera:
+            alerts.append("Regiones distintas de LIMA detectadas: " + ", ".join(fuera))
+
+    return alerts
+
 # =============== M O U G L I ===============
 if app == "Mougli":
     st.markdown("## Mougli – Monitor & OutView")
@@ -71,16 +156,26 @@ if app == "Mougli":
             )
             st.success("¡Listo! ✅")
 
-            # --- Resumen “doble” (misma lógica del core)
+            # --- Resumen enriquecido (en pantalla)
             colA, colB = st.columns(2)
             with colA:
                 st.markdown("#### Monitor")
                 df_m = _read_monitor_txt(up_monitor) if up_monitor else None
-                st.dataframe(resumen_mougli(df_m, es_monitor=True), use_container_width=True)
+                st.dataframe(_web_resumen_enriquecido(df_m, es_monitor=True), use_container_width=True)
             with colB:
                 st.markdown("#### OutView")
                 df_o = _read_out_robusto(up_out) if up_out else None
-                st.dataframe(resumen_mougli(df_o, es_monitor=False), use_container_width=True)
+                st.dataframe(_web_resumen_enriquecido(df_o, es_monitor=False), use_container_width=True)
+
+            # --- Alertas previas a la descarga
+            issues = []
+            issues += _scan_alertas(df_m, es_monitor=True)
+            issues += _scan_alertas(df_o, es_monitor=False)
+
+            if issues:
+                st.warning(
+                    "⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues)
+                )
 
             # --- Descarga Excel multihoja
             st.download_button(
