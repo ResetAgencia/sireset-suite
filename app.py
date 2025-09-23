@@ -8,11 +8,15 @@ import streamlit as st
 import pandas as pd
 
 # --- asegurar import de 'core'
-APP_ROOT = Path(_file_).parent.resolve()
+from pathlib import Path
+import sys
+
+APP_ROOT = Path(__file__).parent.resolve()  # <-- aquí estaba el typo
 for p in (APP_ROOT, APP_ROOT / "core"):
     sp = str(p)
     if sp not in sys.path:
         sys.path.insert(0, sp)
+
 
 # --- Importar mougli_core (módulo completo) y resolver símbolos
 try:
