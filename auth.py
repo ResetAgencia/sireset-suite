@@ -266,3 +266,8 @@ def revoke_all_tokens(user_id: int):
     con=_connect(); cur=con.cursor()
     cur.execute("UPDATE login_tokens SET active=0 WHERE user_id=?", (user_id,))
     con.commit(); con.close()
+
+# al final de auth.py
+login_form = sign_in   # o login, según cómo se llame en tu auth
+login_ui   = login_form
+
