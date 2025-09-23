@@ -13,20 +13,10 @@ for p in (APP_ROOT, APP_ROOT / "core"):
         sys.path.insert(0, sp)
 # ------------------------------------------------------------
 
-# --- Módulos de negocio (tras ajustar sys.path)
+# --- Importar módulo completo y resolver símbolos de forma segura
 try:
-    from core.mougli_core import (
-        procesar_monitor_outview,
-        resumen_mougli,
-        _read_monitor_txt,
-        _read_out_robusto,
-        load_monitor_factors,
-        save_monitor_factors,
-        load_outview_factor,
-        save_outview_factor,
-    )
+    import core.mougli_core as mc  # modulo completo
 except Exception as e:
-    # Mensaje claro en UI si algo falla al importar
     st.error(
         "No pude importar `core.mougli_core`. "
         "Verifica que exista la carpeta **core/** en el mismo nivel que `app.py`, "
@@ -35,12 +25,33 @@ except Exception as e:
     )
     st.stop()
 
-# Si no usas Mapito, puedes comentar esta import y la rama "Mapito"
+def require(symbol_name):
+    """Obtiene un símbolo del módulo mc o muestra error claro."""
+    fn = getattr(mc, symbol_name, None)
+    if fn is None:
+        st.error(
+            f"No encontré la función **{symbol_name}** en `core/mougli_core.py`.\n\n"
+            "Asegúrate de que la versión desplegada de *mougli_core.py* contiene esa función.\n"
+            "Si estás usando una versión antigua, revisa el nombre o expórtala con ese nombre."
+        )
+        st.stop()
+    return fn
+
+# Resolver funciones que usa la app
+procesar_monitor_outview = require("procesar_monitor_outview")
+resumen_mougli = require("resumen_mougli")
+_read_monitor_txt = require("_read_monitor_txt")
+_read_out_robusto = require("_read_out_robusto")
+load_monitor_factors = require("load_monitor_factors")
+save_monitor_factors = require("save_monitor_factors")
+load_outview_factor = require("load_outview_factor")
+save_outview_factor = require("save_outview_factor")
+
+# Mapito (opcional)
 try:
     from core.mapito_core import build_map
-except Exception as e:
-    # Mapito es opcional: si falla, solo mostramos la app Mougli
-    build_map = None
+except Exception:
+    build_map = None  # si no está, ocultamos la opción
 
 # ---------- Config ----------
 st.set_page_config(page_title="SiReset", layout="wide")
@@ -56,7 +67,6 @@ if build_map is not None:
 app = st.sidebar.radio("Elige aplicación", apps, index=0)
 
 st.sidebar.markdown("### Factores")
-# Cargar persistentes
 persist_m = load_monitor_factors()
 persist_o = load_outview_factor()
 
@@ -87,13 +97,9 @@ def _unique_list_str(series, max_items=50):
     if series is None:
         return "—"
     vals = (
-        series.astype(str)
-        .str.strip()
-        .replace({"nan": ""})
-        .dropna()
-        .loc[lambda s: s.str.len() > 0]
-        .unique()
-        .tolist()
+        series.astype(str).str.strip()
+        .replace({"nan": ""}).dropna()
+        .loc[lambda s: s.str.len() > 0].unique().tolist()
     )
     if not vals:
         return "—"
@@ -103,16 +109,11 @@ def _unique_list_str(series, max_items=50):
     return ", ".join(vals)
 
 def _web_resumen_enriquecido(df, *, es_monitor: bool) -> pd.DataFrame:
-    """Devuelve un DataFrame de 2 columnas (Descripción, Valor)."""
     base = resumen_mougli(df, es_monitor=es_monitor)
     if base is None or base.empty:
         base = pd.DataFrame([{"Filas": 0, "Rango de fechas": "—", "Marcas / Anunciantes": 0}])
-    base_vertical = pd.DataFrame({
-        "Descripción": base.columns,
-        "Valor": base.iloc[0].tolist()
-    })
+    base_vertical = pd.DataFrame({"Descripción": base.columns, "Valor": base.iloc[0].tolist()})
 
-    # Extras pedidas
     cat_col = "CATEGORIA" if es_monitor else ("Categoría" if (df is not None and "Categoría" in df.columns) else None)
     reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if (df is not None and "Región" in df.columns) else None)
     tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
@@ -133,47 +134,29 @@ def _web_resumen_enriquecido(df, *, es_monitor: bool) -> pd.DataFrame:
     return base_vertical
 
 def _scan_alertas(df, *, es_monitor: bool):
-    """Devuelve lista de strings con alertas encontradas en un df."""
     if df is None or df.empty:
         return []
-
     alerts = []
-
-    # 1) TIPO ELEMENTO contiene bad values
     tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
     tipo_col = next((c for c in tipo_cols if c in df.columns), None)
     if tipo_col:
-        tipos = (
-            df[tipo_col].astype(str).str.upper().str.strip()
-            .replace({"NAN": ""}).dropna()
-        )
+        tipos = df[tipo_col].astype(str).str.upper().str.strip().replace({"NAN": ""}).dropna()
         malos = sorted(set([t for t in tipos.unique() if t in BAD_TIPOS]))
         if malos:
             alerts.append("Se detectaron valores en TIPO ELEMENTO: " + ", ".join(malos))
-
-    # 2) Región distinta de LIMA
-    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if "Región" in df.columns else None)
+    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if "Región" in (df.columns if df is not None else []) else None)
     if reg_col and reg_col in df.columns:
-        regiones = (
-            df[reg_col].astype(str).str.upper().str.strip()
-            .replace({"NAN": ""}).dropna()
-        )
+        regiones = df[reg_col].astype(str).str.upper().str.strip().replace({"NAN": ""}).dropna()
         fuera = sorted(set([r for r in regiones.unique() if r and r != "LIMA"]))
         if fuera:
             alerts.append("Regiones distintas de LIMA detectadas: " + ", ".join(fuera))
-
     return alerts
 
 def _clone_for_processing_and_summary(upfile):
-    """
-    Devuelve (file_for_processing, file_for_summary) como BytesIO independientes
-    y preserva el .name (extensión) para que los lectores sepan si es .csv/.xlsx.
-    """
     if upfile is None:
         return None, None
     data = upfile.getvalue()
     a = BytesIO(data); b = BytesIO(data)
-    # preservar nombre/extensión:
     name = getattr(upfile, "name", "")
     try:
         setattr(a, "name", name)
@@ -199,20 +182,21 @@ if app == "Mougli":
         )
 
     st.write("")
-    btn = st.button("Procesar Mougli", type="primary")
-    if btn:
+    if st.button("Procesar Mougli", type="primary"):
         try:
-            # --- Copias independientes para evitar punteros “consumidos” ---
             mon_proc, mon_sum = _clone_for_processing_and_summary(up_monitor)
             out_proc, out_sum = _clone_for_processing_and_summary(up_out)
 
-            # Procesa con las copias para procesamiento
             df_result, xlsx = procesar_monitor_outview(
-                mon_proc, out_proc, factores=factores, outview_factor=out_factor
+                mon_proc, out_proc, factores={"TV": st.session_state.get('TV', 0.26) if False else None} or None,
+                outview_factor=st.session_state.get('OUTV', None) if False else None
             )
+            # Nota: arriba paso factores/outview_factor dummy solo para mantener firma;
+            # realmente usaremos los valores del sidebar que ya guardamos abajo:
+            df_result, xlsx = procesar_monitor_outview(mon_proc, out_proc, factores={'TV': f_tv,'CABLE': f_cable,'RADIO': f_radio,'REVISTA': f_revista,'DIARIOS': f_diarios}, outview_factor=out_factor)
+
             st.success("¡Listo! ✅")
 
-            # --- Resumen enriquecido (en pantalla) con las copias para resumen
             colA, colB = st.columns(2)
             with colA:
                 st.markdown("#### Monitor")
@@ -236,14 +220,12 @@ if app == "Mougli":
                         df_o = None
                 st.dataframe(_web_resumen_enriquecido(df_o, es_monitor=False), use_container_width=True)
 
-            # --- Alertas previas a la descarga
             issues = []
             issues += _scan_alertas(df_m, es_monitor=True)
             issues += _scan_alertas(df_o, es_monitor=False)
             if issues:
                 st.warning("⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues))
 
-            # --- Descarga Excel multihoja
             st.download_button(
                 "Descargar Excel",
                 data=xlsx.getvalue(),
@@ -251,7 +233,6 @@ if app == "Mougli":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            # Vista rápida (Consolidado si existe)
             st.markdown("### Vista previa")
             st.dataframe(df_result.head(100), use_container_width=True)
 
@@ -283,4 +264,5 @@ elif app == "Mapito" and build_map is not None:
     except Exception as e:
         st.error(f"No se pudo construir el mapa: {e}")
 else:
-    st.info("Mapito no está disponible en este entorno.")
+    if build_map is None and app == "Mapito":
+        st.info("Mapito no está disponible en este entorno.")
