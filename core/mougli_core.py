@@ -29,7 +29,6 @@ def _read_monitor_txt(file) -> pd.DataFrame:
     if file is None:
         return pd.DataFrame()
 
-    # Streamlit UploadedFile tiene .read() y .seek()
     raw = file.read()
     text = _decode_bytes(raw) if isinstance(raw, (bytes, bytearray)) else raw
     lines = text.splitlines()
@@ -71,7 +70,6 @@ def _read_monitor_txt(file) -> pd.DataFrame:
     if "MEDIO" in df.columns:
         df["MEDIO"] = df["MEDIO"].astype(str).str.upper().str.strip()
 
-    # Inversión a numérico si existe
     if "INVERSION" in df.columns:
         df["INVERSION"] = pd.to_numeric(df["INVERSION"], errors="coerce").fillna(0)
 
@@ -91,22 +89,18 @@ def _read_out_robusto(file) -> pd.DataFrame:
     try:
         if name.endswith(".csv"):
             try:
-                # primer intento: autodetección
                 file.seek(0)
                 return pd.read_csv(file)
             except UnicodeDecodeError:
                 file.seek(0)
                 return pd.read_csv(file, sep=";", encoding="latin-1")
-        # Excel (xlsx/xls)
         file.seek(0)
         return pd.read_excel(file)
     except Exception:
-        # Fallback CSV latino con ;
         try:
             file.seek(0)
             return pd.read_csv(file, sep=";", encoding="latin-1")
         except Exception:
-            # Último recurso: Excel
             file.seek(0)
             return pd.read_excel(file)
 
@@ -139,7 +133,7 @@ def _aplicar_factores_monitor(df: pd.DataFrame, factores: Dict[str, float]) -> p
 
 
 # ==========================
-#  RESÚMENES Y CONSOLIDACIÓN
+#  RESÚMENES
 # ==========================
 _BRAND_CANDS = ["MARCA", "ANUNCIANTE", "BRAND", "CLIENTE"]
 _DATE_MON = ["DIA"]
@@ -168,17 +162,108 @@ def resumen_mougli(df: pd.DataFrame, es_monitor: bool) -> pd.DataFrame:
     return pd.DataFrame([{"Filas": len(df), "Rango de fechas": r, "Marcas / Anunciantes": b}])
 
 
-# Consolidado: si hay claves comunes razonables
-_JOIN_CANDS = ["MARCA", "ANUNCIANTE", "PRODUCTO", "CATEGORIA", "DIA", "Fecha", "FECHA"]
+# ==========================
+#  CONSOLIDADO UNIFICADO
+# ==========================
+_TARGET_ORDER = [
+    "FECHA","AÑO","MES","SEMANA","MEDIO","MARCA","PRODUCTO","VERSIÓN",
+    "DURACIÓN","TIPO ELEMENTO","TIME / Q VERSIONES","EMISORA / DISTRITO",
+    "PROGRAMA / AVENIDA","BREAK / CALLE","POS. SPOT / ORIENTACIÓN",
+    "INVERSIÓN REAL","SECTOR","CATEGORÍA","ÍTEM","AGENCIA","ANUNCIANTE",
+    "REGIÓN","ANCHO / LATITUD","ALTO / LONGITUD","GEN / +1 SUPERFICIE",
+    "Q ELEMENTOS","EDITORA / PROVEEDOR"
+]
 
-def _consolidar(df_m: pd.DataFrame, df_o: pd.DataFrame) -> pd.DataFrame:
-    if df_m.empty or df_o.empty:
-        return pd.DataFrame()
-    # intentamos con un subconjunto de columnas que existan en ambos
-    keys = [k for k in _JOIN_CANDS if (k in df_m.columns and k in df_o.columns)]
-    if not keys:
-        return pd.DataFrame()
-    return df_m.merge(df_o, how="left", on=keys, suffixes=("_m", "_o"))
+# Mapeos “suaves”: solo renombra si existe
+_MONITOR_MAP = {
+    "DIA":"FECHA","AÑO":"AÑO","MES":"MES","SEMANA":"SEMANA",
+    "MEDIO":"MEDIO","MARCA":"MARCA","PRODUCTO":"PRODUCTO","VERSION":"VERSIÓN",
+    "DURACION":"DURACIÓN","TIPO":"TIPO ELEMENTO","HORA":"TIME / Q VERSIONES",
+    "EMISORA/SITE":"EMISORA / DISTRITO","PROGRAMA/TIPO DE SITE":"PROGRAMA / AVENIDA",
+    "BREAK":"BREAK / CALLE","POS. SPOT":"POS. SPOT / ORIENTACIÓN",
+    "INVERSION":"INVERSIÓN REAL","SECTOR":"SECTOR","CATEGORIA":"CATEGORÍA",
+    "ITEM":"ÍTEM","AGENCIA":"AGENCIA","ANUNCIANTE":"ANUNCIANTE",
+    "REGION/ÁMBITO":"REGIÓN","ANCHO":"ANCHO / LATITUD","ALTO":"ALTO / LONGITUD",
+    "GENERO":"GEN / +1 SUPERFICIE","SPOTS":"Q ELEMENTOS","EDITORA":"EDITORA / PROVEEDOR"
+}
+_OUT_MAP = {
+    "Fecha":"FECHA","AÑO":"AÑO","MES":"MES","SEMANA":"SEMANA","Medio":"MEDIO",
+    "Marca":"MARCA","Producto":"PRODUCTO","Versión":"VERSIÓN","Duración (Seg)":"DURACIÓN",
+    "Tipo Elemento":"TIPO ELEMENTO","Q versiones por elemento Mes":"TIME / Q VERSIONES",
+    "Distrito":"EMISORA / DISTRITO","Avenida":"PROGRAMA / AVENIDA",
+    "Nro Calle/Cuadra":"BREAK / CALLE","Orientación de Vía":"POS. SPOT / ORIENTACIÓN",
+    "Tarifa Real ($)":"INVERSIÓN REAL","Sector":"SECTOR",
+    "Categoría":"CATEGORÍA","Item":"ÍTEM","Agencia":"AGENCIA","Anunciante":"ANUNCIANTE",
+    "Región":"REGIÓN","Latitud":"ANCHO / LATITUD","Longitud":"ALTO / LONGITUD",
+    "+1 Superficie":"GEN / +1 SUPERFICIE","Conteo mensual":"Q ELEMENTOS",
+    "Proveedor":"EDITORA / PROVEEDOR"
+}
+
+def _to_unified(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=_TARGET_ORDER)
+    df = df.copy()
+    # Renombrar solo las que existan
+    df.rename(columns={k:v for k,v in mapping.items() if k in df.columns}, inplace=True)
+    # Asegurar todas las columnas del target
+    for c in _TARGET_ORDER:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = df[_TARGET_ORDER]
+    # Tipos clave
+    if "FECHA" in df.columns:
+        df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
+    return df
+
+
+# ==========================
+#  UTIL: escribir tablas XLSX
+# ==========================
+def _col_letter(idx: int) -> str:
+    """0 -> A, 1 -> B, ..."""
+    s = ""
+    n = idx
+    while n >= 0:
+        s = chr(n % 26 + 65) + s
+        n = n // 26 - 1
+    return s
+
+def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *, sheet_name: str,
+                                       df: pd.DataFrame, header_rows: List[Tuple[str, str]]):
+    """
+    Escribe un bloque de encabezado (2 columnas: Descripción, Valor) y debajo
+    una tabla con formato Excel Table para el dataframe.
+    """
+    # 1) Encabezado
+    header_df = pd.DataFrame(header_rows, columns=["Descripción", "Valor"])
+    header_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
+    ws = writer.sheets[sheet_name]
+    # 2) DataFrame como tabla
+    start_row = len(header_df) + 2
+    df = df.copy()
+    df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
+
+    nrow, ncol = df.shape
+    if nrow == 0:
+        # Aún creamos encabezados de tabla para consistencia
+        nrow_for_table = 1
+    else:
+        nrow_for_table = nrow
+
+    start_col_letter = "A"
+    end_col_letter = _col_letter(ncol - 1)
+    # Rango incluye fila de encabezado de columnas (+1)
+    rng = f"{start_col_letter}{start_row+1}:{end_col_letter}{start_row+nrow_for_table+1}"
+
+    ws.add_table(rng, {
+        "name": f"{sheet_name.replace(' ', '_')}_tbl",
+        "header_row": True,
+        "style": "Table Style Medium 9",
+        "columns": [{"header": str(h)} for h in df.columns]
+    })
+    ws.freeze_panes(start_row + 1, 0)  # fija encabezado de la tabla
+    # Ancho de columnas decente
+    ws.set_column(0, max(0, ncol-1), 18)
 
 
 # ==========================
@@ -189,8 +274,8 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float])
     - Lee Monitor con el parser específico (cabecera '#|MEDIO|DIA|...')
     - Aplica factores a INVERSION por MEDIO
     - Lee OutView de forma robusta
-    - Consolida si hay llaves comunes
-    - Devuelve df_result y un Excel multihoja (Monitor, OutView, Consolidado, Resumen)
+    - Construye 'Consolidado' con columnas unificadas (concat de las dos fuentes)
+    - Devuelve df_result y un Excel multihoja con tablas y encabezados
     """
     # MONITOR
     df_m = _read_monitor_txt(monitor_file)
@@ -199,32 +284,71 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float])
     # OUTVIEW
     df_o = _read_out_robusto(out_file)
 
-    # CONSOLIDADO
-    df_c = _consolidar(df_m, df_o)
+    # CONSOLIDADO (unificar columnas y concatenar lo que haya)
+    mon_u = _to_unified(df_m, _MONITOR_MAP) if not df_m.empty else pd.DataFrame(columns=_TARGET_ORDER)
+    out_u = _to_unified(df_o, _OUT_MAP) if not df_o.empty else pd.DataFrame(columns=_TARGET_ORDER)
+    df_c = pd.concat([mon_u, out_u], ignore_index=True)
+    if not df_c.empty:
+        df_c.sort_values(["FECHA","MARCA"], inplace=True, na_position="last")
+
+    # RESÚMENES
+    rm = resumen_mougli(df_m, es_monitor=True);  rm.insert(0, "Fuente", "Monitor")
+    ro = resumen_mougli(df_o, es_monitor=False); ro.insert(0, "Fuente", "OutView")
+    resumen = pd.concat([rm, ro], ignore_index=True)
 
     # EXCEL
     xlsx = BytesIO()
     with pd.ExcelWriter(xlsx, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
+        # Monitor
         if not df_m.empty:
-            df_m.to_excel(w, index=False, sheet_name="Monitor")
+            # Encabezado
+            h_m = [
+                ("Filas", len(df_m)),
+                ("Rango de fechas", resumen.loc[resumen["Fuente"]=="Monitor","Rango de fechas"].iat[0] if not resumen.empty else ""),
+                ("Marcas / Anunciantes", int(resumen.loc[resumen["Fuente"]=="Monitor","Marcas / Anunciantes"].iat[0]) if not resumen.empty else 0)
+            ]
+            _write_sheet_with_header_and_table(w, sheet_name="Monitor", df=df_m, header_rows=h_m)
+
+        # OutView
         if not df_o.empty:
-            df_o.to_excel(w, index=False, sheet_name="OutView")
+            h_o = [
+                ("Filas", len(df_o)),
+                ("Rango de fechas", resumen.loc[resumen["Fuente"]=="OutView","Rango de fechas"].iat[0] if not resumen.empty else ""),
+                ("Marcas / Anunciantes", int(resumen.loc[resumen["Fuente"]=="OutView","Marcas / Anunciantes"].iat[0]) if not resumen.empty else 0)
+            ]
+            _write_sheet_with_header_and_table(w, sheet_name="OutView", df=df_o, header_rows=h_o)
+
+        # Consolidado (si hay al menos una fuente)
         if not df_c.empty:
-            df_c.to_excel(w, index=False, sheet_name="Consolidado")
+            # Encabezado rápido
+            d1, d2 = _date_range(df_c, ["FECHA"])
+            h_c = [
+                ("Filas", len(df_c)),
+                ("Rango de fechas", f"{d1} - {d2}" if d1 and d2 else ""),
+                ("Fuentes incluidas", ("Monitor" if not df_m.empty else "") + (" + " if (not df_m.empty and not df_o.empty) else "") + ("OutView" if not df_o.empty else ""))
+            ]
+            _write_sheet_with_header_and_table(w, sheet_name="Consolidado", df=df_c, header_rows=h_c)
 
-        # Resumen “doble”
-        rm = resumen_mougli(df_m, es_monitor=True);  rm.insert(0, "Fuente", "Monitor")
-        ro = resumen_mougli(df_o, es_monitor=False); ro.insert(0, "Fuente", "OutView")
-        pd.concat([rm, ro], ignore_index=True).to_excel(w, index=False, sheet_name="Resumen")
+        # Resumen (también como tabla)
+        if not resumen.empty:
+            _write_sheet_with_header_and_table(w, sheet_name="Resumen", df=resumen, header_rows=[("Notas","Resumen por fuente")])
 
+        # Ajustes visuales globales
         wb = w.book
         fmt = wb.add_format({"text_wrap": True, "valign": "vcenter"})
         for sh in ("Monitor", "OutView", "Consolidado", "Resumen"):
             if sh in w.sheets:
                 ws = w.sheets[sh]
-                ws.set_column(0, 0, 18, fmt)
+                ws.set_column(0, 0, 22, fmt)
                 ws.set_column(1, 60, 18, fmt)
 
     xlsx.seek(0)
-    df_result = df_c if not df_c.empty else df_m
+    # Resultado principal: Consolidado si existe, si no Monitor, si no OutView
+    if not df_c.empty:
+        df_result = df_c
+    elif not df_m.empty:
+        df_result = df_m
+    else:
+        df_result = df_o
     return df_result, xlsx
+
