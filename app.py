@@ -85,37 +85,32 @@ DATA_DIR = Path("data")
 # ---------- Encabezado ----------
 st.image("assets/Encabezado.png", use_container_width=True)
 
-# ---------- Selector de app ----------
+# ---------- Sidebar ----------
 apps = ["Mougli"]
 if build_map is not None:
     apps.append("Mapito")
 app = st.sidebar.radio("Elige aplicación", apps, index=0)
 
-# ---------- Sidebar: Factores SOLO para Mougli ----------
-if app == "Mougli":
-    st.sidebar.markdown("### Factores")
-    persist_m = load_monitor_factors()
-    persist_o = load_outview_factor()
+st.sidebar.markdown("### Factores")
+persist_m = load_monitor_factors()
+persist_o = load_outview_factor()
 
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        f_tv = st.number_input("TV", min_value=0.0, step=0.01, value=float(persist_m.get("TV", 0.26)))
-        f_cable = st.number_input("CABLE", min_value=0.0, step=0.01, value=float(persist_m.get("CABLE", 0.42)))
-        f_radio = st.number_input("RADIO", min_value=0.0, step=0.01, value=float(persist_m.get("RADIO", 0.42)))
-    with col2:
-        f_revista = st.number_input("REVISTA", min_value=0.0, step=0.01, value=float(persist_m.get("REVISTA", 0.15)))
-        f_diarios = st.number_input("DIARIOS", min_value=0.0, step=0.01, value=float(persist_m.get("DIARIOS", 0.15)))
-        out_factor = st.number_input("OutView ×Superficie", min_value=0.0, step=0.05, value=float(persist_o))
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    f_tv = st.number_input("TV", min_value=0.0, step=0.01, value=float(persist_m.get("TV", 0.26)))
+    f_cable = st.number_input("CABLE", min_value=0.0, step=0.01, value=float(persist_m.get("CABLE", 0.42)))
+    f_radio = st.number_input("RADIO", min_value=0.0, step=0.01, value=float(persist_m.get("RADIO", 0.42)))
+with col2:
+    f_revista = st.number_input("REVISTA", min_value=0.0, step=0.01, value=float(persist_m.get("REVISTA", 0.15)))
+    f_diarios = st.number_input("DIARIOS", min_value=0.0, step=0.01, value=float(persist_m.get("DIARIOS", 0.15)))
+    out_factor = st.number_input("OutView ×Superficie", min_value=0.0, step=0.05, value=float(persist_o))
 
-    factores = {"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios}
+factores = {"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios}
 
-    if st.sidebar.button("💾 Guardar factores"):
-        save_monitor_factors(factores)
-        save_outview_factor(out_factor)
-        st.sidebar.success("Factores guardados.")
-else:
-    # Valores placeholder para llamadas tipadas (no se usan en Mapito)
-    factores, out_factor = {}, 0.0
+if st.sidebar.button("💾 Guardar factores"):
+    save_monitor_factors(factores)
+    save_outview_factor(out_factor)
+    st.sidebar.success("Factores guardados.")
 
 # ---------- Helpers UI ----------
 BAD_TIPOS = {
@@ -276,12 +271,10 @@ if app == "Mougli":
 elif app == "Mapito" and build_map is not None:
     st.markdown("## Mapito – Perú")
 
-    # Estilos de mapa (incluye color de fondo)
     st.sidebar.markdown("### Estilos del mapa")
     color_general = st.sidebar.color_picker("Color general", "#713030")
     color_sel = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
     color_borde = st.sidebar.color_picker("Color de borde", "#000000")
-    color_fondo = st.sidebar.color_picker("Color de fondo del mapa", "#A9D3DF")  # NUEVO
     grosor = st.sidebar.slider("Grosor de borde", 0.1, 2.0, 0.8, 0.05)
     show_borders = st.sidebar.checkbox("Mostrar bordes", value=True)
     show_basemap = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
@@ -291,12 +284,7 @@ elif app == "Mapito" and build_map is not None:
             data_dir=DATA_DIR,
             nivel="regiones",
             colores={"fill": color_general, "selected": color_sel, "border": color_borde},
-            style={
-                "weight": grosor,
-                "show_borders": show_borders,
-                "show_basemap": show_basemap,
-                "bg_color": color_fondo,       # pasa el color de fondo
-            },
+            style={"weight": grosor, "show_borders": show_borders, "show_basemap": show_basemap},
         )
         st.components.v1.html(html, height=700, scrolling=False)
         if seleccion:
