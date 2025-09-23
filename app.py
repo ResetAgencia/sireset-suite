@@ -1,4 +1,4 @@
-# app.py — versión robusta contra ImportError de símbolos sueltos
+# app.py — versión robusta para cambios en mougli_core y mapito_core
 
 import streamlit as st
 from pathlib import Path
@@ -6,7 +6,7 @@ import pandas as pd
 
 st.set_page_config(page_title="SiReset", layout="wide")
 
-# ========= Rutas de datos =========
+# ========= Local paths =========
 DATA_DIR_CANDIDATES = [
     Path(__file__).parent / "core" / "data",
     Path("core/data"),
@@ -15,32 +15,98 @@ DATA_DIR_CANDIDATES = [
 ]
 DATA_DIR = next((p for p in DATA_DIR_CANDIDATES if p.exists()), Path("data"))
 
-# ========= Imports del núcleo =========
-# Mougli
-from core.mougli_core import (
-    procesar_monitor_outview,
-    resumen_mougli,
-    _read_monitor_txt,
-    _read_out_robusto,
-    load_monitor_factors,
-    save_monitor_factors,
-    load_outview_factor,
-    save_outview_factor,
-)
+# ========= Encabezado =========
+st.image("assets/Encabezado.png", use_container_width=True)
 
-# Mapito: importamos el MÓDULO entero y usaremos getattr para evitar ImportError
+# ========= Importar MÓDULOS completos (robusto) =========
+# Mougli
+try:
+    import core.mougli_core as mcore
+except Exception as e:
+    st.error(f"No se pudo cargar 'core.mougli_core': {e}")
+    st.stop()
+
+# Mapito
 try:
     import core.mapito_core as mapito
-except Exception as e:  # si fallara el import del módulo, mostramos mensaje claro
+except Exception as e:
     st.error(f"No se pudo cargar 'core.mapito_core': {e}")
     st.stop()
 
-# Helpers locales por si en el servidor hay una versión vieja de mapito_core
-def _safe(sym_name, fallback):
-    """Devuelve mapito.<sym_name> si existe; de lo contrario usa fallback."""
-    return getattr(mapito, sym_name, fallback)
+def _safe(module, name, fallback):
+    """Devuelve module.name si existe, si no usa fallback."""
+    return getattr(module, name, fallback)
 
-# === Fallbacks mínimos ===
+# ========= Fallbacks Mougli =========
+DEFAULT_FACTORS = {"TV": 0.26, "CABLE": 0.42, "RADIO": 0.42, "REVISTA": 0.15, "DIARIOS": 0.15}
+DEFAULT_OUT_FACTOR = 1.25
+
+def _fallback_resumen(df, es_monitor: bool):
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return pd.DataFrame([{"Filas": 0, "Rango de fechas": "", "Marcas / Anunciantes": 0}])
+    return pd.DataFrame([{"Filas": len(df), "Rango de fechas": "", "Marcas / Anunciantes": 0}])
+
+def _fallback_read_monitor_txt(file):
+    return pd.DataFrame()
+
+def _fallback_read_out(file):
+    return pd.DataFrame()
+
+def _fallback_proc_monitor_outview(monitor_file, out_file, factores, outview_factor=None):
+    # Minimal: devuelve df vacío + Excel vacío
+    from io import BytesIO
+    return pd.DataFrame(), BytesIO()
+
+# Asigna funciones (módulo o fallback)
+procesar_monitor_outview = _safe(mcore, "procesar_monitor_outview", _fallback_proc_monitor_outview)
+resumen_mougli         = _safe(mcore, "resumen_mougli", _fallback_resumen)
+_read_monitor_txt      = _safe(mcore, "_read_monitor_txt", _fallback_read_monitor_txt)
+_read_out_robusto      = _safe(mcore, "_read_out_robusto", _fallback_read_out)
+
+# Manejo de factores persistentes (si el módulo no trae load/save, usa session_state)
+load_monitor_factors = getattr(mcore, "load_monitor_factors", None)
+save_monitor_factors = getattr(mcore, "save_monitor_factors", None)
+load_outview_factor  = getattr(mcore, "load_outview_factor",  None)
+save_outview_factor  = getattr(mcore, "save_outview_factor",  None)
+
+def _get_monitor_factors():
+    if callable(load_monitor_factors):
+        try:
+            val = load_monitor_factors()
+            if isinstance(val, dict):
+                return {**DEFAULT_FACTORS, **val}
+        except Exception:
+            pass
+    # session fallback
+    if "mfactors" not in st.session_state:
+        st.session_state.mfactors = DEFAULT_FACTORS.copy()
+    return st.session_state.mfactors
+
+def _set_monitor_factors(d):
+    if callable(save_monitor_factors):
+        try:
+            save_monitor_factors(d); return
+        except Exception:
+            pass
+    st.session_state.mfactors = d
+
+def _get_out_factor():
+    if callable(load_outview_factor):
+        try:
+            v = float(load_outview_factor()); return v
+        except Exception:
+            pass
+    return float(st.session_state.get("out_factor", DEFAULT_OUT_FACTOR))
+
+def _set_out_factor(v: float):
+    if callable(save_outview_factor):
+        try:
+            save_outview_factor(float(v)); return
+        except Exception:
+            pass
+    st.session_state.out_factor = float(v)
+
+# ========= Fallbacks Mapito =========
 def _fallback_try_import_matplotlib():
     try:
         import matplotlib  # noqa
@@ -78,21 +144,19 @@ def _fallback_build_hierarchy_indices(gj_reg, gj_prov, gj_dist):
     return {"k1": k1, "k2": k2, "k3": k3, "prov_to_reg": prov_to_reg, "dist_to_prov": dist_to_prov,
             "dist_to_reg": dist_to_reg, "reg_to_provs": reg_to_provs, "prov_to_dists": prov_to_dists}
 
-# Asignamos helpers (módulo o fallback)
-try_import_mpl     = _safe("_try_import_matplotlib", _fallback_try_import_matplotlib)
-available_names    = _safe("available_names", _fallback_available_names)
-build_hierarchy    = _safe("build_hierarchy_indices", _fallback_build_hierarchy_indices)
-load_geojson       = _safe("_load_geojson", None)  # este DEBE existir en mapito_core
-build_map          = _safe("build_map", None)      # idem
-export_png         = _safe("export_png_from_geojson", None)
-export_csv_names   = _safe("export_csv_names", lambda names, header="nombre": pd.DataFrame({header:list(names)}).to_csv(index=False).encode("utf-8"))
+_try_import_matplotlib = _safe(mapito, "_try_import_matplotlib", _fallback_try_import_matplotlib)
+available_names        = _safe(mapito, "available_names", _fallback_available_names)
+build_hierarchy        = _safe(mapito, "build_hierarchy_indices", _fallback_build_hierarchy_indices)
+_load_geojson          = getattr(mapito, "_load_geojson", None)
+build_map              = getattr(mapito, "build_map", None)
+export_png             = getattr(mapito, "export_png_from_geojson", None)
+export_csv_names       = getattr(mapito, "export_csv_names", lambda names, header="nombre": pd.DataFrame({header:list(names)}).to_csv(index=False).encode("utf-8"))
 
-if load_geojson is None or build_map is None:
-    st.error("Tu 'core/mapito_core.py' está desactualizado. Sube la versión nueva que incluye '_load_geojson' y 'build_map'.")
+if _load_geojson is None or build_map is None:
+    st.error("Tu 'core/mapito_core.py' está desactualizado. Sube la versión nueva que expone '_load_geojson' y 'build_map'.")
     st.stop()
 
-# ========= UI común =========
-st.image("assets/Encabezado.png", use_container_width=True)
+# ========= App switcher =========
 app = st.sidebar.radio("Elige aplicación", ["Mougli", "Mapito"], index=0)
 
 # ======================================================================
@@ -100,22 +164,22 @@ app = st.sidebar.radio("Elige aplicación", ["Mougli", "Mapito"], index=0)
 # ======================================================================
 if app == "Mougli":
     st.sidebar.markdown("### Factores (Monitor/OutView)")
-    persist_m = load_monitor_factors()
-    persist_o = load_outview_factor()
+    mf = _get_monitor_factors()
+    of = _get_out_factor()
 
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        f_tv = st.number_input("TV", min_value=0.0, step=0.01, value=float(persist_m.get("TV", 0.26)))
-        f_cable = st.number_input("CABLE", min_value=0.0, step=0.01, value=float(persist_m.get("CABLE", 0.42)))
-        f_radio = st.number_input("RADIO", min_value=0.0, step=0.01, value=float(persist_m.get("RADIO", 0.42)))
+        f_tv = st.number_input("TV",     min_value=0.0, step=0.01, value=float(mf.get("TV", 0.26)))
+        f_cable = st.number_input("CABLE",  min_value=0.0, step=0.01, value=float(mf.get("CABLE", 0.42)))
+        f_radio = st.number_input("RADIO",  min_value=0.0, step=0.01, value=float(mf.get("RADIO", 0.42)))
     with col2:
-        f_revista = st.number_input("REVISTA", min_value=0.0, step=0.01, value=float(persist_m.get("REVISTA", 0.15)))
-        f_diarios = st.number_input("DIARIOS", min_value=0.0, step=0.01, value=float(persist_m.get("DIARIOS", 0.15)))
-        out_factor = st.number_input("OutView ×Superficie", min_value=0.0, step=0.05, value=float(persist_o))
+        f_revista = st.number_input("REVISTA", min_value=0.0, step=0.01, value=float(mf.get("REVISTA", 0.15)))
+        f_diarios = st.number_input("DIARIOS", min_value=0.0, step=0.01, value=float(mf.get("DIARIOS", 0.15)))
+        out_factor = st.number_input("OutView ×Superficie", min_value=0.0, step=0.05, value=float(of))
 
     if st.sidebar.button("💾 Guardar factores"):
-        save_monitor_factors({"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios})
-        save_outview_factor(out_factor)
+        _set_monitor_factors({"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios})
+        _set_out_factor(out_factor)
         st.sidebar.success("Factores guardados.")
 
     st.markdown("## Mougli – Monitor & OutView")
@@ -173,9 +237,15 @@ if app == "Mougli":
 
     if st.button("Procesar Mougli", type="primary"):
         try:
-            df_result, xlsx = procesar_monitor_outview(up_monitor, up_out,
-                                                       factores={"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios},
-                                                       outview_factor=out_factor)
+            # Llamada tolerante a diferentes firmas
+            try:
+                df_result, xlsx = procesar_monitor_outview(up_monitor, up_out,
+                                                          factores={"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios},
+                                                          outview_factor=out_factor)
+            except TypeError:
+                df_result, xlsx = procesar_monitor_outview(up_monitor, up_out,
+                                                          factores={"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios})
+
             st.success("¡Listo! ✅")
 
             colA, colB = st.columns(2)
@@ -208,7 +278,7 @@ if app == "Mougli":
             st.error(f"Ocurrió un error procesando: {e}")
 
 # ======================================================================
-# M A P I T O (UX jerárquica, con imports robustos)
+# M A P I T O (UX jerárquica)
 # ======================================================================
 else:
     st.markdown("## Mapito – Perú")
@@ -228,15 +298,15 @@ else:
     bg_color = None
     if not png_transparent:
         bg_color = st.sidebar.color_picker("Color de fondo del PNG", "#FFFFFF")
-    have_mpl = try_import_mpl()
+    have_mpl = _try_import_matplotlib()
     if not have_mpl:
         st.sidebar.info("Para exportar PNG instala: `pip install matplotlib`")
 
-    # Cargar datos
+    # Cargar geojsons
     try:
-        gj_reg = load_geojson(DATA_DIR, "regiones")
-        gj_prov = load_geojson(DATA_DIR, "provincias")
-        gj_dist = load_geojson(DATA_DIR, "distritos")
+        gj_reg = _load_geojson(DATA_DIR, "regiones")
+        gj_prov = _load_geojson(DATA_DIR, "provincias")
+        gj_dist = _load_geojson(DATA_DIR, "distritos")
     except Exception as e:
         st.error(f"No se pudieron cargar los GeoJSON: {e}")
         st.stop()
@@ -271,7 +341,7 @@ else:
     if sel_prov: st.markdown("**Provincias:** " + chips(sel_prov), unsafe_allow_html=True)
     if sel_dist: st.markdown("**Distritos:** " + chips(sel_dist), unsafe_allow_html=True)
 
-    # Nivel a dibujar (más específico)
+    # Nivel a dibujar
     if sel_dist:
         draw_level, draw_selection = "distritos", sel_dist
     elif sel_prov:
