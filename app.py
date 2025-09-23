@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from io import BytesIO
 import inspect
+import json
 
 import streamlit as st
 import pandas as pd
@@ -264,104 +265,87 @@ if app == "Mougli":
 elif app == "Mapito" and build_map is not None:
     st.markdown("## Mapito – Perú")
 
-    # ---- Estilos del mapa
-    st.sidebar.markdown("### Estilos del mapa")
-    color_general = st.sidebar.color_picker("Color general", "#713030")
-    color_sel     = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
-    color_borde   = st.sidebar.color_picker("Color de borde", "#000000")
-    color_fondo   = st.sidebar.color_picker("Color de fondo del mapa", "#CAE3EC")
-    grosor        = st.sidebar.slider("Grosor de borde", 0.1, 2.0, 0.8, 0.05)
-    show_borders  = True
-    show_basemap  = True
-
-    # ---- Datos jerárquicos (catálogos) a partir de GADM
-    # Para no sobrecargar, listados mínimos usando los propios GeoJSON
-    import json
+    # ── Carga rápida de catálogos para las listas jerárquicas
     def _read_fc(p: Path) -> dict:
         return json.loads((DATA_DIR / p).read_text(encoding="utf-8"))
 
-    gj1 = _read_fc(Path("gadm41_PER_1.json"))
-    gj2 = _read_fc(Path("gadm41_PER_2.json"))
-    gj3 = _read_fc(Path("gadm41_PER_3.json"))
+    gj1 = _read_fc(Path("gadm41_PER_1.json"))  # regiones
+    gj2 = _read_fc(Path("gadm41_PER_2.json"))  # provincias
+    gj3 = _read_fc(Path("gadm41_PER_3.json"))  # distritos
 
     regiones = sorted({f["properties"]["NAME_1"] for f in gj1["features"]})
-
-    # Filtros jerárquicos
-    sel_reg = st.sidebar.multiselect("Regiones", regiones, default=[])
-
     prov_all = [(f["properties"]["NAME_1"], f["properties"]["NAME_2"]) for f in gj2["features"]]
-    prov_disp = sorted({p for p in prov_all if (not sel_reg) or p[0] in sel_reg})
-    sel_prov = st.sidebar.multiselect("Provincias", prov_disp, format_func=lambda t: f"{t[1]} ({t[0]})", default=[])
-
     dist_all = [
         (f["properties"]["NAME_1"], f["properties"]["NAME_2"], f["properties"]["NAME_3"])
         for f in gj3["features"]
     ]
-    if sel_prov:
-        prov_set = set(sel_prov)
-        dist_disp = sorted({d for d in dist_all if (d[0], d[1]) in prov_set})
-    elif sel_reg:
-        reg_set = set(sel_reg)
-        dist_disp = sorted({d for d in dist_all if d[0] in reg_set})
-    else:
-        dist_disp = []
 
-    sel_dist = st.sidebar.multiselect(
-        "Distritos", dist_disp, format_func=lambda t: f"{t[2]} - {t[1]} ({t[0]})", default=[]
-    )
-
-    # ---- Zonas de Lima (por distritos)
-    st.sidebar.markdown("### Zonas de Lima (distritos)")
-    ZONAS_LIMA = {
-        "Norte": [
-            "Ancón", "Santa Rosa", "Puente Piedra", "Comas", "Carabayllo",
-            "Independencia", "San Martín de Porres", "Los Olivos",
-        ],
-        "Centro": [
-            "Lima", "Breña", "Lince", "Jesús María", "La Victoria",
-            "Pueblo Libre", "Magdalena del Mar", "San Miguel",
-        ],
-        "Este": [
-            "San Juan de Lurigancho", "Ate", "Santa Anita", "El Agustino",
-            "La Molina", "Chaclacayo", "Cieneguilla", "Lurigancho-Chosica",
-        ],
-        "Sur": [
-            "San Juan de Miraflores", "Villa María del Triunfo", "Villa El Salvador",
-            "Pachacámac", "Lurín", "Punta Hermosa", "Punta Negra", "San Bartolo",
-            "Pucusana", "Santa María del Mar", "Chorrillos",
-        ],
-        "Callao": [
-            "Callao", "Bellavista", "Carmen de la Legua-Reynoso",
-            "La Perla", "La Punta", "Ventanilla", "Mi Perú",
-        ],
-    }
-    zonas_sel = st.sidebar.multiselect("Zonas", list(ZONAS_LIMA.keys()), default=[])
+    # ── Fila 1: Selectores jerárquicos
+    with st.container():
+        c1, c2, c3, c4 = st.columns([1.1, 1.4, 1.8, 1.2])
+        with c1:
+            sel_reg = st.multiselect("Regiones", regiones, default=[])
+        with c2:
+            prov_disp = sorted({p for p in prov_all if (not sel_reg) or p[0] in sel_reg})
+            sel_prov = st.multiselect("Provincias", prov_disp, format_func=lambda t: f"{t[1]} ({t[0]})", default=[])
+        with c3:
+            if sel_prov:
+                prov_set = set(sel_prov)
+                dist_disp = sorted({d for d in dist_all if (d[0], d[1]) in prov_set})
+            elif sel_reg:
+                reg_set = set(sel_reg)
+                dist_disp = sorted({d for d in dist_all if d[0] in reg_set})
+            else:
+                dist_disp = []
+            sel_dist = st.multiselect("Distritos", dist_disp, format_func=lambda t: f"{t[2]} - {t[1]} ({t[0]})", default=[])
+        with c4:
+            ZONAS_LIMA = {
+                "Norte": ["Ancón", "Santa Rosa", "Puente Piedra", "Comas", "Carabayllo",
+                          "Independencia", "San Martín de Porres", "Los Olivos"],
+                "Centro": ["Lima", "Breña", "Lince", "Jesús María", "La Victoria",
+                           "Pueblo Libre", "Magdalena del Mar", "San Miguel"],
+                "Este": ["San Juan de Lurigancho", "Ate", "Santa Anita", "El Agustino",
+                         "La Molina", "Chaclacayo", "Cieneguilla", "Lurigancho-Chosica"],
+                "Sur": ["San Juan de Miraflores", "Villa María del Triunfo", "Villa El Salvador",
+                        "Pachacámac", "Lurín", "Punta Hermosa", "Punta Negra", "San Bartolo",
+                        "Pucusana", "Santa María del Mar", "Chorrillos"],
+                "Callao": ["Callao", "Bellavista", "Carmen de la Legua-Reynoso",
+                           "La Perla", "La Punta", "Ventanilla", "Mi Perú"],
+            }
+            zonas_sel = st.multiselect("Zonas de Lima", list(ZONAS_LIMA.keys()), default=[])
 
     # Expandir zonas a distritos (Lima/Callao)
     if zonas_sel:
-        # Lima / Lima (provincia 'Lima') y Región Callao (provincia Callao)
-        zona_dists = set()
-        for z in zonas_sel:
-            zona_dists.update(ZONAS_LIMA.get(z, []))
-        # Agregar a selección de distritos si existen en GADM
         dist_lookup = set((d[0].lower(), d[1].lower(), d[2].lower()) for d in dist_all)
-        # Lima
-        for d in zona_dists:
-            k1 = ("lima", "lima", d.lower())
-            if k1 in dist_lookup:
-                sel_dist.append(("Lima", "Lima", d))
-        # Callao (región, provincia 'Callao')
-        for d in zona_dists:
-            k2 = ("callao", "callao", d.lower())
-            if k2 in dist_lookup:
-                sel_dist.append(("Callao", "Callao", d))
+        extra = []
+        for z in zonas_sel:
+            for d in ZONAS_LIMA.get(z, []):
+                k1 = ("lima", "lima", d.lower())
+                k2 = ("callao", "callao", d.lower())
+                if k1 in dist_lookup:
+                    extra.append(("Lima", "Lima", d))
+                if k2 in dist_lookup:
+                    extra.append(("Callao", "Callao", d))
+        sel_dist = sorted(set(list(sel_dist) + extra))
 
-        # Evitar duplicados
-        sel_dist = sorted(set(sel_dist))
+    # ── Fila 2: Estilos y opciones de vista
+    with st.container():
+        s1, s2, s3, s4, s5 = st.columns([1.0, 1.0, 1.0, 1.0, 1.0])
+        with s1:
+            color_general = st.color_picker("Color general", "#713030")
+        with s2:
+            color_sel = st.color_picker("Color seleccionado", "#5F48C6")
+        with s3:
+            color_borde = st.color_picker("Color de borde", "#000000")
+        with s4:
+            color_fondo = st.color_picker("Color de fondo del mapa", "#CAE3EC")
+        with s5:
+            fit_selected = st.checkbox("Ajustar vista a lo seleccionado", value=True)
 
-    fit_selected = st.sidebar.checkbox("Ajustar vista a lo seleccionado", value=True)
+    # (los controles tipo OSM/LayerControl siguen saliendo DENTRO del mapa)
+    show_basemap = True
+    grosor = 0.8
 
-    # ---- Preparar selections para mapito_core (en lowercase)
     def low(s): return (s or "").strip().lower()
     selections = {
         "regions":   [low(r) for r in sel_reg],
@@ -369,7 +353,6 @@ elif app == "Mapito" and build_map is not None:
         "districts": [(low(a), low(b), low(c)) for (a, b, c) in sel_dist],
     }
 
-    # ---- Construir mapa
     try:
         html, meta = build_map(
             data_dir=DATA_DIR,
@@ -387,3 +370,4 @@ elif app == "Mapito" and build_map is not None:
 else:
     if build_map is None and app == "Mapito":
         st.info("Mapito no está disponible en este entorno.")
+
