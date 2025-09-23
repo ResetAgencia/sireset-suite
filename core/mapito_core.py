@@ -1,4 +1,3 @@
-# core/mapito_core.py
 from pathlib import Path
 import json
 import folium
@@ -42,7 +41,7 @@ def build_map(
     colores: dict | None = None,
     style: dict | None = None,
 ):
-    """Devuelve (html, seleccion) para usar con st.components.v1.html."""
+    """Devuelve (html, seleccion) para usar con st.components.v1.html en app.py."""
     colores = colores or {}
     style = style or {}
     col_fill = colores.get("fill", "#713030")
@@ -51,6 +50,7 @@ def build_map(
     weight = float(style.get("weight", 0.8))
     show_borders = bool(style.get("show_borders", True))
     show_basemap = bool(style.get("show_basemap", True))
+    bg_color = style.get("bg_color", "#A9D3DF")  # NUEVO: color de fondo
 
     nivel = (nivel or "regiones").lower().strip()
     if nivel not in {"regiones", "provincias", "distritos"}:
@@ -58,10 +58,19 @@ def build_map(
 
     gj = _load_geojson(data_dir, nivel)
 
+    # Perú centrado
     m = folium.Map(location=[-9.2, -75.0], zoom_start=5, tiles=None)
     if show_basemap:
         folium.TileLayer("openstreetmap", name="OSM").add_to(m)
 
+    # Inyectar CSS para color de fondo del lienzo Leaflet
+    m.get_root().html.add_child(
+        folium.Element(
+            f"<style>.leaflet-container{{background:{bg_color} !important;}}</style>"
+        )
+    )
+
+    # Elegir nombre para tooltip
     props = gj["features"][0]["properties"]
     name_key = None
     for cand in ("name", "NAME", "NAME_1", "NAME_2", "NAME_3"):
@@ -89,5 +98,4 @@ def build_map(
 
     folium.LayerControl().add_to(m)
     html = _folium_to_html(m)
-    return html, []  # <- SIEMPRE dos valores
-
+    return html, []
