@@ -18,10 +18,11 @@ from core.mougli_core import (
 from core.mapito_core import (
     build_map,
     available_names,
-    _load_geojson,               # para poblar el multiselect
-    export_png_from_geojson,     # exportaciones
+    _load_geojson,
+    export_png_from_geojson,
     export_csv_names,
     _try_import_matplotlib,
+    build_hierarchy_indices,
 )
 
 # =========================
@@ -150,7 +151,6 @@ if app == "Mougli":
     btn = st.button("Procesar Mougli", type="primary")
     if btn:
         try:
-            # Nota: procesar_monitor_outview acepta factores y factor outview
             df_result, xlsx = procesar_monitor_outview(up_monitor, up_out, factores=factores, outview_factor=out_factor)
             st.success("¡Listo! ✅")
 
@@ -159,14 +159,14 @@ if app == "Mougli":
                 st.markdown("#### Monitor")
                 df_m = None
                 if up_monitor is not None:
-                    up_monitor.seek(0)  # reset pointer
+                    up_monitor.seek(0)
                     df_m = _read_monitor_txt(up_monitor)
                 st.dataframe(_web_resumen_enriquecido(df_m, es_monitor=True), use_container_width=True)
             with colB:
                 st.markdown("#### OutView")
                 df_o = None
                 if up_out is not None:
-                    up_out.seek(0)      # reset pointer
+                    up_out.seek(0)
                     df_o = _read_out_robusto(up_out)
                 st.dataframe(_web_resumen_enriquecido(df_o, es_monitor=False), use_container_width=True)
 
@@ -190,15 +190,12 @@ if app == "Mougli":
             st.error(f"Ocurrió un error procesando: {e}")
 
 # ======================================================================
-# M A P I T O
+# M A P I T O  (UX jerárquica)
 # ======================================================================
 else:
     st.markdown("## Mapito – Perú")
 
-    # Nivel administrativo
-    nivel = st.radio("Nivel", ["regiones", "provincias", "distritos"], horizontal=True, index=0)
-
-    # Estilos del mapa
+    # Estilos del mapa (sidebar)
     st.sidebar.markdown("### Estilos del mapa")
     color_general = st.sidebar.color_picker("Color general", "#713030")
     color_sel = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
@@ -213,53 +210,82 @@ else:
     bg_color = None
     if not png_transparent:
         bg_color = st.sidebar.color_picker("Color de fondo del PNG", "#FFFFFF")
-
     have_mpl = _try_import_matplotlib()
     if not have_mpl:
         st.sidebar.info("Para exportar PNG instala: `pip install matplotlib`")
 
-    # Chips CSS
-    st.markdown(
-        """
-        <style>
-        .chip {display:inline-block;padding:6px 10px;margin:0 6px 6px 0;border-radius:16px;background:#efefef;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    # Cargar geojsons e índices solo una vez
+    gj_reg = _load_geojson(DATA_DIR, "regiones")
+    gj_prov = _load_geojson(DATA_DIR, "provincias")
+    gj_dist = _load_geojson(DATA_DIR, "distritos")
+    idx = build_hierarchy_indices(gj_reg, gj_prov, gj_dist)
+
+    # === Selectores jerárquicos ===
+    st.caption("Selecciona por niveles (las opciones se filtran automáticamente).")
+    colR, colP, colD = st.columns(3)
+
+    # Regiones
+    reg_all = available_names(gj_reg, idx["k1"])
+    sel_reg = colR.multiselect("Regiones", options=reg_all, default=[], help="Escribe para buscar")
+
+    # Provincias filtradas por regiones seleccionadas
+    if sel_reg:
+        prov_opts = sorted({p for r in sel_reg for p in idx["reg_to_provs"].get(r, set())})
+    else:
+        prov_opts = available_names(gj_prov, idx["k2"])
+    sel_prov = colP.multiselect("Provincias", options=prov_opts, default=[], help="Se filtran por regiones elegidas")
+
+    # Distritos filtrados por provincias seleccionadas (o regiones cuando no hay provincias)
+    if sel_prov:
+        dist_opts = sorted({d for p in sel_prov for d in idx["prov_to_dists"].get(p, set())})
+    elif sel_reg:
+        # todas las prov de esas regiones → sus distritos
+        provs = {p for r in sel_reg for p in idx["reg_to_provs"].get(r, set())}
+        dist_opts = sorted({d for p in provs for d in idx["prov_to_dists"].get(p, set())})
+    else:
+        dist_opts = available_names(gj_dist, idx["k3"])
+    sel_dist = colD.multiselect("Distritos", options=dist_opts, default=[], help="Se filtran por provincias elegidas")
+
+    # Chips
+    def chips(lst):
+        return " ".join(f"<span style='display:inline-block;padding:6px 10px;margin:0 6px 6px 0;border-radius:16px;background:#efefef'>{s}</span>" for s in lst)
+    if sel_reg: st.markdown("**Regiones:** " + chips(sel_reg), unsafe_allow_html=True)
+    if sel_prov: st.markdown("**Provincias:** " + chips(sel_prov), unsafe_allow_html=True)
+    if sel_dist: st.markdown("**Distritos:** " + chips(sel_dist), unsafe_allow_html=True)
+
+    # Determinar nivel a dibujar (más específico disponible)
+    if sel_dist:
+        draw_level = "distritos"
+        draw_selection = sel_dist
+    elif sel_prov:
+        draw_level = "provincias"
+        draw_selection = sel_prov
+    else:
+        draw_level = "regiones"
+        draw_selection = sel_reg
 
     try:
-        # Lista de nombres para selector según nivel
-        gj_for_list = _load_geojson(DATA_DIR, nivel)
-        # name_field se resuelve dentro de build_map; aquí solo sacamos opciones
-        # Elegimos mejor heuristicamente:
-        name_field = {"regiones": "NAME_1", "provincias": "NAME_2", "distritos": "NAME_3"}.get(nivel)
-        all_names = available_names(gj_for_list, name_field)
-
-        sel = st.multiselect(f"Selecciona {nivel} a resaltar", options=all_names, default=[], help="Escribe para buscar")
-        if sel:
-            st.write(" ".join(f"<span class='chip'>{s}</span>" for s in sel), unsafe_allow_html=True)
-
-        # Construcción del mapa
-        html, seleccion_norm, gj, name_key = build_map(
+        html, seleccion_norm, gj_draw, name_key = build_map(
             data_dir=DATA_DIR,
-            nivel=nivel,
+            nivel=draw_level,
             colores={"fill": color_general, "selected": color_sel, "border": color_borde},
             style={"weight": grosor, "show_borders": show_borders, "show_basemap": show_basemap},
-            seleccion=sel,
+            seleccion=draw_selection,
         )
         st.components.v1.html(html, height=700, scrolling=False)
-        st.caption(f"Elementos resaltados: {len(seleccion_norm)}")
+
+        st.caption(f"Mostrando: **{draw_level}** — resaltados: {len(seleccion_norm)}")
 
         # Descargas
         colA, colB, colC = st.columns(3)
         with colA:
-            csv_bytes = export_csv_names(seleccion_norm or all_names)
-            st.download_button("⬇ CSV (nombres mostrados)", data=csv_bytes, file_name=f"{nivel}.csv", mime="text/csv")
+            csv_bytes = export_csv_names(seleccion_norm or available_names(gj_draw, name_key), header=name_key)
+            st.download_button("⬇ CSV (mostrado)", data=csv_bytes, file_name=f"{draw_level}.csv", mime="text/csv")
+
         if have_mpl:
             with colB:
                 png_bytes = export_png_from_geojson(
-                    gj,
+                    gj_draw,
                     seleccion=seleccion_norm,
                     name_key=name_key,
                     color_fill=color_general,
@@ -267,11 +293,11 @@ else:
                     color_border=color_borde,
                     background=None if png_transparent else bg_color,
                 )
-                fname = f"mapito_{nivel}_{'transp' if png_transparent else 'fondo'}.png"
+                fname = f"mapito_{draw_level}_{'transp' if png_transparent else 'fondo'}.png"
                 st.download_button("⬇ PNG (actual)", data=png_bytes, file_name=fname, mime="image/png")
             with colC:
                 png_bytes_alt = export_png_from_geojson(
-                    gj,
+                    gj_draw,
                     seleccion=seleccion_norm,
                     name_key=name_key,
                     color_fill=color_general,
@@ -279,9 +305,8 @@ else:
                     color_border=color_borde,
                     background="#FFFFFF" if png_transparent else None,
                 )
-                altname = f"mapito_{nivel}_{'fondo' if png_transparent else 'transp'}.png"
+                altname = f"mapito_{draw_level}_{'fondo' if png_transparent else 'transp'}.png"
                 st.download_button("⬇ PNG (alterno)", data=png_bytes_alt, file_name=altname, mime="image/png")
 
     except Exception as e:
         st.error(f"No se pudo construir el mapa: {e}")
-
