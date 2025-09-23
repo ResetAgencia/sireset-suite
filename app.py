@@ -1,5 +1,6 @@
 import streamlit as st
 from pathlib import Path
+import pandas as pd
 
 # --- Módulos de negocio
 from core.mougli_core import (
@@ -73,34 +74,39 @@ def _unique_list_str(series, max_items=50):
         return ", ".join(vals[:max_items]) + f" … (+{len(vals)-max_items} más)"
     return ", ".join(vals)
 
-def _web_resumen_enriquecido(df, *, es_monitor: bool):
-    if df is None or df.empty:
-        return resumen_mougli(df, es_monitor=es_monitor)
-    # Base
-    base = resumen_mougli(df, es_monitor=es_monitor).copy()
+def _web_resumen_enriquecido(df, *, es_monitor: bool) -> pd.DataFrame:
+    """Devuelve un DataFrame de 2 columnas (Descripción, Valor)."""
+    base = resumen_mougli(df, es_monitor=es_monitor)
+    # base viene como 1 fila con varias columnas; lo giro a (Descripción, Valor)
+    if base is None or base.empty:
+        base = pd.DataFrame([{"Filas": 0, "Rango de fechas": "—", "Marcas / Anunciantes": 0}])
+    base_vertical = pd.DataFrame({
+        "Descripción": base.columns,
+        "Valor": base.iloc[0].tolist()
+    })
+
     # Extras pedidas
-    cat_col = "CATEGORIA" if es_monitor else ("Categoría" if "Categoría" in df.columns else None)
-    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if "Región" in df.columns else None)
+    cat_col = "CATEGORIA" if es_monitor else ("Categoría" if (df is not None and "Categoría" in df.columns) else None)
+    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if (df is not None and "Región" in df.columns) else None)
     tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
-    tipo_col = next((c for c in tipo_cols if c in df.columns), None)
+    tipo_col = next((c for c in tipo_cols if (df is not None and c in df.columns)), None)
 
-    # Armar fila única con strings listados
-    extras = {}
-    if cat_col:
-        extras["Categorías (únicas)"] = _unique_list_str(df[cat_col])
-    if reg_col:
-        extras["Regiones (únicas)"] = _unique_list_str(df[reg_col])
-    if tipo_col:
-        extras["Tipos de elemento (únicos)"] = _unique_list_str(df[tipo_col])
+    extras_rows = []
+    if df is not None and not df.empty:
+        if cat_col:
+            extras_rows.append({"Descripción": "Categorías (únicas)", "Valor": _unique_list_str(df[cat_col])})
+        if reg_col:
+            extras_rows.append({"Descripción": "Regiones (únicas)", "Valor": _unique_list_str(df[reg_col])})
+        if tipo_col:
+            extras_rows.append({"Descripción": "Tipos de elemento (únicos)", "Valor": _unique_list_str(df[tipo_col])})
 
-    for k, v in extras.items():
-        base[k] = v
-    return base
+    if extras_rows:
+        base_vertical = pd.concat([base_vertical, pd.DataFrame(extras_rows)], ignore_index=True)
+
+    return base_vertical
 
 def _scan_alertas(df, *, es_monitor: bool):
-    """
-    Devuelve lista de strings con alertas encontradas en un df.
-    """
+    """Devuelve lista de strings con alertas encontradas en un df."""
     if df is None or df.empty:
         return []
 
@@ -151,20 +157,34 @@ if app == "Mougli":
     btn = st.button("Procesar Mougli", type="primary")
     if btn:
         try:
+            # Procesa (esto consume los file-like)
             df_result, xlsx = procesar_monitor_outview(
                 up_monitor, up_out, factores=factores, outview_factor=out_factor
             )
             st.success("¡Listo! ✅")
 
-            # --- Resumen enriquecido (en pantalla)
+            # --- Resumen enriquecido (en pantalla) - OJO: reseteo punteros
             colA, colB = st.columns(2)
             with colA:
                 st.markdown("#### Monitor")
-                df_m = _read_monitor_txt(up_monitor) if up_monitor else None
+                df_m = None
+                if up_monitor is not None:
+                    try:
+                        up_monitor.seek(0)   # ← importante: volver al inicio
+                        df_m = _read_monitor_txt(up_monitor)
+                    except Exception:
+                        df_m = None
                 st.dataframe(_web_resumen_enriquecido(df_m, es_monitor=True), use_container_width=True)
+
             with colB:
                 st.markdown("#### OutView")
-                df_o = _read_out_robusto(up_out) if up_out else None
+                df_o = None
+                if up_out is not None:
+                    try:
+                        up_out.seek(0)       # ← importante: volver al inicio
+                        df_o = _read_out_robusto(up_out)
+                    except Exception:
+                        df_o = None
                 st.dataframe(_web_resumen_enriquecido(df_o, es_monitor=False), use_container_width=True)
 
             # --- Alertas previas a la descarga
