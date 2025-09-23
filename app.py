@@ -2,21 +2,45 @@ import streamlit as st
 from pathlib import Path
 import pandas as pd
 from io import BytesIO
+import sys
 
-# --- Módulos de negocio
-from core.mougli_core import (
-    procesar_monitor_outview,
-    resumen_mougli,
-    _read_monitor_txt,
-    _read_out_robusto,
-    load_monitor_factors,
-    save_monitor_factors,
-    load_outview_factor,
-    save_outview_factor,
-)
+# ------------------------------------------------------------
+# Asegurar que Python vea el proyecto y la carpeta 'core'
+APP_ROOT = Path(__file__).parent.resolve()
+for p in (APP_ROOT, APP_ROOT / "core"):
+    sp = str(p)
+    if sp not in sys.path:
+        sys.path.insert(0, sp)
+# ------------------------------------------------------------
+
+# --- Módulos de negocio (tras ajustar sys.path)
+try:
+    from core.mougli_core import (
+        procesar_monitor_outview,
+        resumen_mougli,
+        _read_monitor_txt,
+        _read_out_robusto,
+        load_monitor_factors,
+        save_monitor_factors,
+        load_outview_factor,
+        save_outview_factor,
+    )
+except Exception as e:
+    # Mensaje claro en UI si algo falla al importar
+    st.error(
+        "No pude importar `core.mougli_core`. "
+        "Verifica que exista la carpeta **core/** en el mismo nivel que `app.py`, "
+        "que dentro esté el archivo **mougli_core.py** y (si es posible) añade un `__init__.py` vacío en `core/`.\n\n"
+        f"Detalle técnico: {e}"
+    )
+    st.stop()
 
 # Si no usas Mapito, puedes comentar esta import y la rama "Mapito"
-from core.mapito_core import build_map
+try:
+    from core.mapito_core import build_map
+except Exception as e:
+    # Mapito es opcional: si falla, solo mostramos la app Mougli
+    build_map = None
 
 # ---------- Config ----------
 st.set_page_config(page_title="SiReset", layout="wide")
@@ -26,7 +50,10 @@ DATA_DIR = Path("data")
 st.image("assets/Encabezado.png", use_container_width=True)
 
 # ---------- Sidebar: selector & ajustes ----------
-app = st.sidebar.radio("Elige aplicación", ["Mougli", "Mapito"], index=0)
+apps = ["Mougli"]
+if build_map is not None:
+    apps.append("Mapito")
+app = st.sidebar.radio("Elige aplicación", apps, index=0)
 
 st.sidebar.markdown("### Factores")
 # Cargar persistentes
@@ -78,7 +105,6 @@ def _unique_list_str(series, max_items=50):
 def _web_resumen_enriquecido(df, *, es_monitor: bool) -> pd.DataFrame:
     """Devuelve un DataFrame de 2 columnas (Descripción, Valor)."""
     base = resumen_mougli(df, es_monitor=es_monitor)
-    # base viene como 1 fila con varias columnas; lo giro a (Descripción, Valor)
     if base is None or base.empty:
         base = pd.DataFrame([{"Filas": 0, "Rango de fechas": "—", "Marcas / Anunciantes": 0}])
     base_vertical = pd.DataFrame({
@@ -233,7 +259,7 @@ if app == "Mougli":
             st.error(f"Ocurrió un error procesando: {e}")
 
 # =============== M A P I T O ===============
-else:
+elif app == "Mapito" and build_map is not None:
     st.markdown("## Mapito – Perú")
 
     st.sidebar.markdown("### Estilos del mapa")
@@ -256,3 +282,5 @@ else:
             st.caption(f"Elementos mostrados: {len(seleccion)}")
     except Exception as e:
         st.error(f"No se pudo construir el mapa: {e}")
+else:
+    st.info("Mapito no está disponible en este entorno.")
