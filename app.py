@@ -294,3 +294,12 @@ elif app == "Mapito" and build_map is not None:
 else:
     if build_map is None and app == "Mapito":
         st.info("Mapito no está disponible en este entorno.")
+
+# --- Colócalo AL FINAL de app.py ---
+import traceback
+try:
+    pass  # tu código ya se ejecutó arriba; si todo está en funciones, llama a main() aquí
+except Exception as e:
+    import streamlit as st
+    st.error("Falló la inicialización de la app:")
+    st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
