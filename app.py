@@ -284,3 +284,4 @@ else:
 
     except Exception as e:
         st.error(f"No se pudo construir el mapa: {e}")
+
