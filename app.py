@@ -9,7 +9,6 @@ import streamlit as st
 import pandas as pd
 
 # ---------------- Autenticación ----------------
-# Tu auth.py debe exponer: login_ui(), current_user(), logout_button()
 from auth import login_ui, current_user, logout_button
 
 # ---------- Config general ----------
@@ -34,7 +33,6 @@ except Exception as e:
     )
     st.stop()
 
-
 def require_any(preferido: str, *alternativos: str):
     """Devuelve la primera función disponible entre preferido y alias."""
     candidatos = (preferido, *alternativos)
@@ -52,21 +50,19 @@ def require_any(preferido: str, *alternativos: str):
     )
     st.stop()
 
-
 # Resolver funciones/exportaciones de mougli_core
 procesar_monitor_outview = require_any(
     "procesar_monitor_outview",
     "procesar_monitor_outview_v2",
     "procesar_outview_monitor",
 )
-resumen_mougli = require_any("resumen_mougli")
-_read_monitor_txt = require_any("_read_monitor_txt")
-_read_out_robusto = require_any("_read_out_robusto")
+resumen_mougli      = require_any("resumen_mougli")
+_read_monitor_txt   = require_any("_read_monitor_txt")
+_read_out_robusto   = require_any("_read_out_robusto")
 load_monitor_factors = require_any("load_monitor_factors")
 save_monitor_factors = require_any("save_monitor_factors")
-load_outview_factor = require_any("load_outview_factor")
-save_outview_factor = require_any("save_outview_factor")
-
+load_outview_factor  = require_any("load_outview_factor")
+save_outview_factor  = require_any("save_outview_factor")
 
 def llamar_procesar_monitor_outview(monitor_file, out_file, factores, outview_factor):
     """Llama a procesar_monitor_outview tolerando firmas distintas."""
@@ -83,7 +79,6 @@ def llamar_procesar_monitor_outview(monitor_file, out_file, factores, outview_fa
             return procesar_monitor_outview(monitor_file, out_file, factores, outview_factor)
         except TypeError:
             return procesar_monitor_outview(monitor_file, out_file, factores)
-
 
 # --------- Helpers de UI y datos ---------
 BAD_TIPOS = {
@@ -116,7 +111,6 @@ def _web_resumen_enriquecido(df: Optional[pd.DataFrame], *, es_monitor: bool) ->
         base = pd.DataFrame([{"Filas": 0, "Rango de fechas": "—", "Marcas / Anunciantes": 0}])
     base_vertical = pd.DataFrame({"Descripción": base.columns, "Valor": base.iloc[0].tolist()})
 
-    # columnas extra
     cat_col = "CATEGORIA" if es_monitor else ("Categoría" if (df is not None and "Categoría" in df.columns) else None)
     reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if (df is not None and "Región" in df.columns) else None)
     tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
@@ -157,7 +151,7 @@ def _scan_alertas(df: Optional[pd.DataFrame], *, es_monitor: bool) -> List[str]:
     reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if ("Región" in df.columns) else None)
     if reg_col and reg_col in df.columns:
         regiones = df[reg_col].astype(str).str.upper().str.strip().replace({"NAN": ""}).dropna()
-        fuera = sorted(set([r for r in regiones.unique() if r and r != "LIMA"]))
+        fuera = sorted(set([r for r in regiones.unique() if r and r != "LIMA"]));
         if fuera:
             alerts.append("Regiones distintas de LIMA detectadas: " + ", ".join(fuera))
     return alerts
@@ -226,26 +220,27 @@ def combinar_outview(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
         pass
     return out, dfc
 
-
 # ------------------- LOGIN (obligatorio) -------------------
 user = current_user()
 if not user:
-    login_ui()           # muestra el formulario y hace st.stop() internamente al enviar
+    login_ui()
     st.stop()
 
 # Sidebar: saludo + logout
 with st.sidebar:
     st.markdown(f"**Usuario:** {user.get('name') or user.get('email', '—')}")
+    st.caption(f"Rol: {user.get('role','—')}")
     logout_button()
 
 # ------------------- Apps permitidas por usuario -------------------
-# user["modules"] debe ser p.ej. ["mougli", "mapito"]
 mods = [m.lower() for m in (user.get("modules") or [])]
 allowed = []
-if "mougli" in mods:
-    allowed.append("Mougli")
-if "mapito" in mods:
-    allowed.append("Mapito")
+if user.get("role") == "admin":
+    allowed = ["Mougli", "Mapito"]
+else:
+    if "mougli" in mods: allowed.append("Mougli")
+    if "mapito" in mods: allowed.append("Mapito")
+
 if not allowed:
     st.warning("Tu usuario no tiene módulos habilitados. Pide acceso a un administrador.")
     st.stop()
@@ -260,12 +255,12 @@ if app == "Mougli":
     persist_o = load_outview_factor()
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        f_tv = st.number_input("TV", min_value=0.0, step=0.01, value=float(persist_m.get("TV", 0.26)))
-        f_cable = st.number_input("CABLE", min_value=0.0, step=0.01, value=float(persist_m.get("CABLE", 0.42)))
-        f_radio = st.number_input("RADIO", min_value=0.0, step=0.01, value=float(persist_m.get("RADIO", 0.42)))
+        f_tv    = st.number_input("TV",     min_value=0.0, step=0.01, value=float(persist_m.get("TV", 0.26)))
+        f_cable = st.number_input("CABLE",  min_value=0.0, step=0.01, value=float(persist_m.get("CABLE", 0.42)))
+        f_radio = st.number_input("RADIO",  min_value=0.0, step=0.01, value=float(persist_m.get("RADIO", 0.42)))
     with col2:
         f_revista = st.number_input("REVISTA", min_value=0.0, step=0.01, value=float(persist_m.get("REVISTA", 0.15)))
-        f_diarios = st.number_input("DIARIOS", min_value=0.0, step=0.01, value=float(persist_m.get("DIARIOS", 0.15)))
+        f_diarios = st.number_input("DIARIOS",  min_value=0.0, step=0.01, value=float(persist_m.get("DIARIOS", 0.15)))
         out_factor = st.number_input("OutView ×Superficie", min_value=0.0, step=0.05, value=float(persist_o))
     factores = {"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios}
     if st.sidebar.button("💾 Guardar factores"):
@@ -349,7 +344,6 @@ if app == "Mougli":
 elif app == "Mapito":
     st.markdown("## Mapito – Perú")
 
-    # Import tardío (si no lo tienes, Mapito no aparece en el radio)
     try:
         from core.mapito_core import build_map
     except Exception:
@@ -358,14 +352,13 @@ elif app == "Mapito":
     if build_map is None:
         st.info("Mapito no está disponible en este entorno.")
     else:
-        # Estilos en la barra lateral (se quedan aquí para Mapito)
         st.sidebar.markdown("### Estilos del mapa")
         color_general = st.sidebar.color_picker("Color general", "#713030")
-        color_sel = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
-        color_borde = st.sidebar.color_picker("Color de borde", "#000000")
-        grosor = st.sidebar.slider("Grosor de borde", 0.1, 2.0, 0.8, 0.05)
-        show_borders = st.sidebar.checkbox("Mostrar bordes", value=True)
-        show_basemap = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
+        color_sel     = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
+        color_borde   = st.sidebar.color_picker("Color de borde", "#000000")
+        grosor        = st.sidebar.slider("Grosor de borde", 0.1, 2.0, 0.8, 0.05)
+        show_borders  = st.sidebar.checkbox("Mostrar bordes", value=True)
+        show_basemap  = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
 
         DATA_DIR = Path("data")
         try:
