@@ -1,382 +1,409 @@
-# app.py
-import sys
-from pathlib import Path
-from io import BytesIO
-import inspect
-from typing import Tuple, Optional, List
+# auth.py — Autenticación + usuarios + registro de módulos + tokens persistentes
+from __future__ import annotations
+
+import os
+import sqlite3
+import json
+import base64
+import hashlib
+import hmac
+import time
+from typing import Optional, Tuple, Dict, Any, List
 
 import streamlit as st
-import pandas as pd
-
-# ---------------- Autenticación ----------------
-# Tu auth.py debe exponer: login_ui(), current_user(), logout_button()
-from auth import login_ui, current_user, logout_button
-
-# ---------- Config general ----------
-st.set_page_config(page_title="SiReset", layout="wide")
-st.image("assets/Encabezado.png", use_container_width=True)
-
-# --- asegurar import de 'core'
-APP_ROOT = Path(__file__).parent.resolve()
-for p in (APP_ROOT, APP_ROOT / "core"):
-    sp = str(p)
-    if sp not in sys.path:
-        sys.path.insert(0, sp)
-
-# --- Importar mougli_core (módulo completo) y resolver símbolos
-try:
-    import core.mougli_core as mc
-except Exception as e:
-    st.error(
-        "No pude importar core.mougli_core. Verifica que exista la carpeta *core/* al lado de app.py "
-        "y que dentro esté mougli_core.py.\n\n"
-        f"Detalle técnico: {e}"
-    )
-    st.stop()
 
 
-def require_any(preferido: str, *alternativos: str):
-    """Devuelve la primera función disponible entre preferido y alias."""
-    candidatos = (preferido, *alternativos)
-    for name in candidatos:
-        fn = getattr(mc, name, None)
-        if callable(fn):
-            if name != preferido:
-                st.info(f"Usando {name}() como alias de {preferido}().")
-            return fn
-    exports = sorted([x for x in dir(mc) if not x.startswith("_")])
-    st.error(
-        f"No encontré la función *{preferido}* en core/mougli_core.py.\n\n"
-        f"Alias probados: {', '.join(alternativos) or '—'}\n\n"
-        f"Funciones visibles en el módulo: {', '.join(exports) or '—'}"
-    )
-    st.stop()
+# =========================== Configuración DB ===========================
 
-
-# Resolver funciones/exportaciones de mougli_core
-procesar_monitor_outview = require_any(
-    "procesar_monitor_outview",
-    "procesar_monitor_outview_v2",
-    "procesar_outview_monitor",
+DB_PATH = os.environ.get(
+    "SIRESET_DB_PATH",
+    os.path.join(os.path.dirname(__file__), "sireset.db"),
 )
-resumen_mougli = require_any("resumen_mougli")
-_read_monitor_txt = require_any("_read_monitor_txt")
-_read_out_robusto = require_any("_read_out_robusto")
-load_monitor_factors = require_any("load_monitor_factors")
-save_monitor_factors = require_any("save_monitor_factors")
-load_outview_factor = require_any("load_outview_factor")
-save_outview_factor = require_any("save_outview_factor")
 
+def _connect():
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
 
-def llamar_procesar_monitor_outview(monitor_file, out_file, factores, outview_factor):
-    """Llama a procesar_monitor_outview tolerando firmas distintas."""
-    try:
-        sig = inspect.signature(procesar_monitor_outview).parameters
-        if "outview_factor" in sig:
-            return procesar_monitor_outview(
-                monitor_file, out_file, factores=factores, outview_factor=outview_factor
-            )
-        else:
-            return procesar_monitor_outview(monitor_file, out_file, factores=factores)
-    except TypeError:
-        try:
-            return procesar_monitor_outview(monitor_file, out_file, factores, outview_factor)
-        except TypeError:
-            return procesar_monitor_outview(monitor_file, out_file, factores)
+def init_db():
+    """Crea tablas si no existen."""
+    con = _connect()
+    cur = con.cursor()
 
-
-# --------- Helpers de UI y datos ---------
-BAD_TIPOS = {
-    "INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
-    "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"
-}
-
-def _unique_list_str(series, max_items=50):
-    if series is None:
-        return "—"
-    vals = (
-        series.astype(str)
-        .str.strip()
-        .replace({"nan": ""})
-        .dropna()
-        .loc[lambda s: s.str.len() > 0]
-        .unique()
-        .tolist()
-    )
-    if not vals:
-        return "—"
-    vals = sorted(set(vals))
-    if len(vals) > max_items:
-        return ", ".join(vals[:max_items]) + f" … (+{len(vals)-max_items} más)"
-    return ", ".join(vals)
-
-def _web_resumen_enriquecido(df: Optional[pd.DataFrame], *, es_monitor: bool) -> pd.DataFrame:
-    base = resumen_mougli(df, es_monitor=es_monitor) if df is not None else None
-    if base is None or base.empty:
-        base = pd.DataFrame([{"Filas": 0, "Rango de fechas": "—", "Marcas / Anunciantes": 0}])
-    base_vertical = pd.DataFrame({"Descripción": base.columns, "Valor": base.iloc[0].tolist()})
-
-    # columnas extra
-    cat_col = "CATEGORIA" if es_monitor else ("Categoría" if (df is not None and "Categoría" in df.columns) else None)
-    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if (df is not None and "Región" in df.columns) else None)
-    tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
-    tipo_col = next((c for c in tipo_cols if (df is not None and c in df.columns)), None)
-
-    extras_rows = []
-    if df is not None and not df.empty:
-        if cat_col:
-            extras_rows.append({"Descripción": "Categorías (únicas)", "Valor": _unique_list_str(df[cat_col])})
-        if reg_col:
-            extras_rows.append({"Descripción": "Regiones (únicas)", "Valor": _unique_list_str(df[reg_col])})
-        if tipo_col:
-            extras_rows.append({"Descripción": "Tipos de elemento (únicos)", "Valor": _unique_list_str(df[tipo_col])})
-
-    if extras_rows:
-        base_vertical = pd.concat([base_vertical, pd.DataFrame(extras_rows)], ignore_index=True)
-
-    return base_vertical
-
-def _scan_alertas(df: Optional[pd.DataFrame], *, es_monitor: bool) -> List[str]:
-    if df is None or df.empty:
-        return []
-    alerts = []
-    tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
-    tipo_col = next((c for c in tipo_cols if c in df.columns), None)
-    if tipo_col:
-        tipos = (
-            df[tipo_col]
-            .astype(str)
-            .str.upper()
-            .str.strip()
-            .replace({"NAN": ""})
-            .dropna()
+    # Usuarios
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          email   TEXT UNIQUE NOT NULL,
+          name    TEXT NOT NULL,
+          role    TEXT NOT NULL,
+          pw_hash TEXT NOT NULL,
+          active  INTEGER NOT NULL DEFAULT 1,
+          modules TEXT NOT NULL DEFAULT '[]'
         )
-        malos = sorted(set([t for t in tipos.unique() if t in BAD_TIPOS]))
-        if malos:
-            alerts.append("Se detectaron valores en TIPO ELEMENTO: " + ", ".join(malos))
-    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if ("Región" in df.columns) else None)
-    if reg_col and reg_col in df.columns:
-        regiones = df[reg_col].astype(str).str.upper().str.strip().replace({"NAN": ""}).dropna()
-        fuera = sorted(set([r for r in regiones.unique() if r and r != "LIMA"]))
-        if fuera:
-            alerts.append("Regiones distintas de LIMA detectadas: " + ", ".join(fuera))
-    return alerts
+    """)
 
-def _read_out_file_to_df(upload) -> pd.DataFrame:
-    name = (getattr(upload, "name", "") or "").lower()
-    try:
-        upload.seek(0)
-    except Exception:
-        pass
-    try:
-        if name.endswith(".csv"):
-            try:
-                return pd.read_csv(upload)
-            except UnicodeDecodeError:
-                upload.seek(0)
-                return pd.read_csv(upload, sep=";", encoding="latin-1")
-        return pd.read_excel(upload)
-    except Exception:
-        try:
-            upload.seek(0)
-            return pd.read_csv(upload, sep=";", encoding="latin-1")
-        except Exception:
-            return pd.DataFrame()
-
-def combinar_monitor_txt(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
-    if not files:
-        return None, None
-    buf = BytesIO()
-    for i, f in enumerate(files):
-        data = f.getvalue()
-        if i > 0:
-            buf.write(b"\n")
-        buf.write(data)
-    buf.seek(0)
-    try:
-        setattr(buf, "name", "monitor_combined.txt")
-    except Exception:
-        pass
-    df_m = None
-    try:
-        buf.seek(0)
-        df_m = _read_monitor_txt(buf)
-        buf.seek(0)
-    except Exception:
-        df_m = None
-    return buf, df_m
-
-def combinar_outview(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
-    if not files:
-        return None, None
-    dfs = []
-    for f in files:
-        df = _read_out_file_to_df(f)
-        if df is not None and not df.empty:
-            dfs.append(df)
-    if not dfs:
-        return None, None
-    dfc = pd.concat(dfs, ignore_index=True)
-    out = BytesIO()
-    dfc.to_csv(out, index=False)
-    out.seek(0)
-    try:
-        setattr(out, "name", "outview_combined.csv")
-    except Exception:
-        pass
-    return out, dfc
-
-
-# ------------------- LOGIN (obligatorio) -------------------
-user = current_user()
-if not user:
-    login_ui()           # muestra el formulario y hace st.stop() internamente al enviar
-    st.stop()
-
-# Sidebar: saludo + logout
-with st.sidebar:
-    st.markdown(f"**Usuario:** {user.get('name') or user.get('email', '—')}")
-    logout_button()
-
-# ------------------- Apps permitidas por usuario -------------------
-# user["modules"] debe ser p.ej. ["mougli", "mapito"]
-mods = [m.lower() for m in (user.get("modules") or [])]
-allowed = []
-if "mougli" in mods:
-    allowed.append("Mougli")
-if "mapito" in mods:
-    allowed.append("Mapito")
-if not allowed:
-    st.warning("Tu usuario no tiene módulos habilitados. Pide acceso a un administrador.")
-    st.stop()
-
-# ---------- Sidebar: selector de app ----------
-app = st.sidebar.radio("Elige aplicación", allowed, index=0)
-
-# ---------- Factores SOLO visibles en Mougli ----------
-if app == "Mougli":
-    st.sidebar.markdown("### Factores")
-    persist_m = load_monitor_factors()
-    persist_o = load_outview_factor()
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        f_tv = st.number_input("TV", min_value=0.0, step=0.01, value=float(persist_m.get("TV", 0.26)))
-        f_cable = st.number_input("CABLE", min_value=0.0, step=0.01, value=float(persist_m.get("CABLE", 0.42)))
-        f_radio = st.number_input("RADIO", min_value=0.0, step=0.01, value=float(persist_m.get("RADIO", 0.42)))
-    with col2:
-        f_revista = st.number_input("REVISTA", min_value=0.0, step=0.01, value=float(persist_m.get("REVISTA", 0.15)))
-        f_diarios = st.number_input("DIARIOS", min_value=0.0, step=0.01, value=float(persist_m.get("DIARIOS", 0.15)))
-        out_factor = st.number_input("OutView ×Superficie", min_value=0.0, step=0.05, value=float(persist_o))
-    factores = {"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios}
-    if st.sidebar.button("💾 Guardar factores"):
-        save_monitor_factors(factores)
-        save_outview_factor(out_factor)
-        st.sidebar.success("Factores guardados.")
-
-# =============== M O U G L I ===============
-if app == "Mougli":
-    st.markdown("## Mougli – Monitor & OutView")
-
-    colL, colR = st.columns(2)
-    with colL:
-        st.caption("Sube Monitor (.txt) — puedes subir varios")
-        up_monitor_multi = st.file_uploader(
-            "Arrastra y suelta aquí", type=["txt"], key="m_txt_multi",
-            label_visibility="collapsed", accept_multiple_files=True
+    # Módulos (Mougli/Mapito)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS modules (
+          code    TEXT PRIMARY KEY,
+          title   TEXT NOT NULL,
+          file    TEXT,
+          func    TEXT,
+          enabled INTEGER NOT NULL DEFAULT 1
         )
-    with colR:
-        st.caption("Sube OutView (.csv / .xlsx) — puedes subir varios")
-        up_out_multi = st.file_uploader(
-            "Arrastra y suelta aquí", type=["csv", "xlsx"], key="o_multi",
-            label_visibility="collapsed", accept_multiple_files=True
+    """)
+
+    # Tokens de login persistente (?tk=...)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS login_tokens (
+          token_hash TEXT PRIMARY KEY,
+          user_id    INTEGER NOT NULL,
+          expires    INTEGER NOT NULL,
+          active     INTEGER NOT NULL DEFAULT 1,
+          created_ts INTEGER NOT NULL,
+          FOREIGN KEY(user_id) REFERENCES users(id)
         )
+    """)
 
-    st.write("")
-    if st.button("Procesar Mougli", type="primary"):
-        try:
-            mon_proc, df_m_res = combinar_monitor_txt(up_monitor_multi or [])
-            out_proc, df_o_res = combinar_outview(up_out_multi or [])
+    con.commit()
+    con.close()
 
-            df_result, xlsx = llamar_procesar_monitor_outview(
-                mon_proc, out_proc, factores=factores, outview_factor=out_factor
+def ensure_builtin_modules():
+    """Registra Mougli y Mapito si no existen."""
+    con = _connect()
+    cur = con.cursor()
+    for code, title in [("Mougli", "Mougli"), ("Mapito", "Mapito")]:
+        cur.execute("SELECT 1 FROM modules WHERE code=?", (code,))
+        if cur.fetchone() is None:
+            cur.execute(
+                "INSERT INTO modules(code,title,file,func,enabled) VALUES(?,?,?,?,1)",
+                (code, title, "", ""),
             )
+    con.commit()
+    con.close()
 
-            st.success("¡Listo! ✅")
-
-            colA, colB = st.columns(2)
-            with colA:
-                st.markdown("#### Monitor")
-                if df_m_res is None and mon_proc is not None:
-                    try:
-                        mon_proc.seek(0)
-                        df_m_res = _read_monitor_txt(mon_proc)
-                        mon_proc.seek(0)
-                    except Exception:
-                        df_m_res = None
-                st.dataframe(_web_resumen_enriquecido(df_m_res, es_monitor=True), use_container_width=True)
-
-            with colB:
-                st.markdown("#### OutView")
-                if df_o_res is None and out_proc is not None:
-                    try:
-                        out_proc.seek(0)
-                        df_o_res = _read_out_robusto(out_proc)
-                        out_proc.seek(0)
-                    except Exception:
-                        df_o_res = None
-                st.dataframe(_web_resumen_enriquecido(df_o_res, es_monitor=False), use_container_width=True)
-
-            issues = []
-            issues += _scan_alertas(df_m_res, es_monitor=True)
-            issues += _scan_alertas(df_o_res, es_monitor=False)
-            if issues:
-                st.warning("⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues))
-
-            st.download_button(
-                "Descargar Excel",
-                data=xlsx.getvalue(),
-                file_name="SiReset_Mougli.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-            st.markdown("### Vista previa")
-            st.dataframe(df_result.head(100), use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Ocurrió un error procesando: {e}")
-
-# =============== M A P I T O ===============
-elif app == "Mapito":
-    st.markdown("## Mapito – Perú")
-
-    # Import tardío (si no lo tienes, Mapito no aparece en el radio)
-    try:
-        from core.mapito_core import build_map
-    except Exception:
-        build_map = None
-
-    if build_map is None:
-        st.info("Mapito no está disponible en este entorno.")
+def list_all_modules(enabled_only: bool = False) -> List[Dict[str, Any]]:
+    con = _connect()
+    cur = con.cursor()
+    if enabled_only:
+        cur.execute("SELECT * FROM modules WHERE enabled=1 ORDER BY title")
     else:
-        # Estilos en la barra lateral (se quedan aquí para Mapito)
-        st.sidebar.markdown("### Estilos del mapa")
-        color_general = st.sidebar.color_picker("Color general", "#713030")
-        color_sel = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
-        color_borde = st.sidebar.color_picker("Color de borde", "#000000")
-        grosor = st.sidebar.slider("Grosor de borde", 0.1, 2.0, 0.8, 0.05)
-        show_borders = st.sidebar.checkbox("Mostrar bordes", value=True)
-        show_basemap = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
+        cur.execute("SELECT * FROM modules ORDER BY title")
+    rows = cur.fetchall()
+    con.close()
+    return [{
+        "code":   r["code"],
+        "title":  r["title"],
+        "file":   r["file"] or "",
+        "func":   r["func"] or "",
+        "enabled": bool(r["enabled"]),
+    } for r in rows]
 
-        DATA_DIR = Path("data")
-        try:
-            html, seleccion = build_map(
-                data_dir=DATA_DIR,
-                nivel="regiones",
-                colores={"fill": color_general, "selected": color_sel, "border": color_borde},
-                style={"weight": grosor, "show_borders": show_borders, "show_basemap": show_basemap},
-            )
-            st.components.v1.html(html, height=700, scrolling=False)
-            if seleccion:
-                st.caption(f"Elementos mostrados: {len(seleccion)}")
-        except Exception as e:
-            st.error(f"No se pudo construir el mapa: {e}")
+
+# =========================== Password hashing ===========================
+
+_PBKDF2_ITERS = 240_000
+
+def _hash_pw(password: str) -> str:
+    if not isinstance(password, str):
+        password = str(password)
+    salt = os.urandom(16)
+    import hashlib as _hl
+    dk = _hl.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PBKDF2_ITERS)
+    return "pbkdf2${}${}${}".format(
+        _PBKDF2_ITERS,
+        base64.urlsafe_b64encode(salt).decode("ascii"),
+        base64.urlsafe_b64encode(dk).decode("ascii"),
+    )
+
+def _verify_pw(password: str, stored: str) -> bool:
+    try:
+        scheme, iters, salt_b64, hash_b64 = stored.split("$", 3)
+        if scheme != "pbkdf2":
+            return False
+        iters = int(iters)
+        salt = base64.urlsafe_b64decode(salt_b64.encode("ascii"))
+        target = base64.urlsafe_b64decode(hash_b64.encode("ascii"))
+        import hashlib as _hl
+        cand = _hl.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters)
+        return hmac.compare_digest(cand, target)
+    except Exception:
+        return False
+
+
+# =========================== CRUD de usuarios ===========================
+
+def admin_exists() -> bool:
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("SELECT 1 FROM users WHERE role='admin' LIMIT 1")
+    ok = cur.fetchone() is not None
+    con.close()
+    return ok
+
+def _row_to_user(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "name": row["name"],
+        "role": row["role"],
+        "active": bool(row["active"]),
+        "modules": json.loads(row["modules"] or "[]"),
+    }
+
+def find_user_by_email(email: str) -> Optional[Tuple[int, Dict[str, Any]]]:
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM users WHERE email=?", (email.lower().strip(),))
+    r = cur.fetchone()
+    con.close()
+    if not r:
+        return None
+    return r["id"], _row_to_user(r)
+
+def get_user(uid: int) -> Optional[Dict[str, Any]]:
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM users WHERE id=?", (uid,))
+    r = cur.fetchone()
+    con.close()
+    return _row_to_user(r) if r else None
+
+def list_users() -> List[Dict[str, Any]]:
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM users ORDER BY id ASC")
+    rows = cur.fetchall()
+    con.close()
+    return [_row_to_user(r) for r in rows]
+
+def _default_user_modules() -> List[str]:
+    return [m["code"] for m in list_all_modules(enabled_only=True)]
+
+def create_user(email: str, name: str, role: str, pwd: str,
+                active: bool = True, modules: Optional[List[str]] = None) -> int:
+    modules = modules if modules is not None else _default_user_modules()
+    pw_hash = _hash_pw(pwd)
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO users(email,name,role,pw_hash,active,modules)
+        VALUES (?,?,?,?,?,?)
+    """, (email.lower().strip(), name.strip(), role.strip(), pw_hash,
+          1 if active else 0, json.dumps(modules)))
+    con.commit()
+    uid = cur.lastrowid
+    con.close()
+    return uid
+
+def update_user(uid: int, *, name: Optional[str] = None, role: Optional[str] = None,
+                pw_hash: Optional[str] = None, active: Optional[bool] = None,
+                modules: Optional[List[str]] = None):
+    con = _connect()
+    cur = con.cursor()
+    sets, vals = [], []
+    if name    is not None: sets.append("name=?");    vals.append(name)
+    if role    is not None: sets.append("role=?");    vals.append(role)
+    if pw_hash is not None: sets.append("pw_hash=?"); vals.append(pw_hash)
+    if active  is not None: sets.append("active=?");  vals.append(1 if active else 0)
+    if modules is not None: sets.append("modules=?"); vals.append(json.dumps(modules))
+    if not sets:
+        con.close()
+        return
+    vals.append(uid)
+    cur.execute(f"UPDATE users SET {', '.join(sets)} WHERE id=?", vals)
+    con.commit()
+    con.close()
+
+def set_password(uid: int, new_pwd: str):
+    update_user(uid, pw_hash=_hash_pw(new_pwd))
+
+def authenticate(email: str, pwd: str) -> Optional[Dict[str, Any]]:
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM users WHERE email=?", (email.lower().strip(),))
+    r = cur.fetchone()
+    con.close()
+    if not r:
+        return None
+    if not bool(r["active"]):
+        return None
+    if not _verify_pw(pwd, r["pw_hash"]):
+        return None
+    return _row_to_user(r)
+
+
+# =========================== Tokens persistentes ===========================
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def create_login_token(user_id: int, days: int = 90) -> str:
+    raw = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+    token_hash = _sha256(raw)
+    now = int(time.time())
+    exp = now + days * 24 * 60 * 60
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO login_tokens(token_hash,user_id,expires,active,created_ts)
+        VALUES (?,?,?,?,?)
+    """, (token_hash, user_id, exp, 1, now))
+    con.commit()
+    con.close()
+    return raw
+
+def user_from_token(token: str) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+    token_hash = _sha256(token)
+    now = int(time.time())
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT u.* FROM login_tokens t
+        JOIN users u ON u.id=t.user_id
+        WHERE t.token_hash=? AND t.active=1 AND t.expires>=?
+    """, (token_hash, now))
+    r = cur.fetchone()
+    con.close()
+    if not r:
+        return None
+    u = _row_to_user(r)
+    if not u["active"]:
+        return None
+    return u
+
+def revoke_token(token: str):
+    token_hash = _sha256(token)
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("UPDATE login_tokens SET active=0 WHERE token_hash=?", (token_hash,))
+    con.commit()
+    con.close()
+
+def revoke_all_tokens(user_id: int):
+    con = _connect()
+    cur = con.cursor()
+    cur.execute("UPDATE login_tokens SET active=0 WHERE user_id=?", (user_id,))
+    con.commit()
+    con.close()
+
+
+# =========================== Helpers de sesión/UI ===========================
+
+def _get_query_params() -> Dict[str, Any]:
+    try:
+        # Streamlit 1.31+
+        return dict(st.query_params)
+    except Exception:
+        # Compatibilidad
+        return st.experimental_get_query_params()
+
+def _set_query_params(**kwargs):
+    try:
+        st.query_params.clear()
+        for k, v in kwargs.items():
+            if v is None:
+                continue
+            st.query_params[k] = v
+    except Exception:
+        st.experimental_set_query_params(**{k: v for k, v in kwargs.items() if v is not None})
+
+def _set_user(u: Optional[Dict[str, Any]]):
+    st.session_state["user"] = u
+
+def current_user() -> Optional[Dict[str, Any]]:
+    return st.session_state.get("user")
+
+def user_has_module(user: Optional[Dict[str, Any]], code: str) -> bool:
+    if not user:
+        return False
+    if user.get("role") == "admin":
+        return True
+    return code in (user.get("modules") or [])
+
+
+# =========================== UI pública ===========================
+
+def _bootstrap_if_needed():
+    """Crea el admin inicial si la BD está vacía y registra módulos base."""
+    init_db()
+    ensure_builtin_modules()
+    if not admin_exists():
+        st.info("No existe un administrador. Crea el primero para iniciar el sistema.")
+        with st.form("create_admin", clear_on_submit=False):
+            email = st.text_input("Email (admin)")
+            name  = st.text_input("Nombre")
+            pwd   = st.text_input("Contraseña", type="password")
+            ok = st.form_submit_button("Crear administrador")
+        if ok:
+            if not email or not name or not pwd:
+                st.error("Completa todos los campos.")
+            else:
+                create_user(email=email, name=name, role="admin", pwd=pwd, active=True)
+                st.success("Administrador creado. Ahora puedes iniciar sesión.")
+        st.stop()
+
+def login_ui():
+    """Dibuja el formulario de login y resuelve token persistente en URL."""
+    _bootstrap_if_needed()
+
+    # Auto-login por token ?tk=
+    q = _get_query_params()
+    token = q.get("tk") or q.get("token")
+    if isinstance(token, list):
+        token = token[0] if token else None
+    if token and not current_user():
+        u = user_from_token(token)
+        if u:
+            _set_user(u)
+            st.success(f"Autenticado como {u['name']}")
+            return
+
+    u = current_user()
+    if u:
+        st.success(f"Sesión iniciada: {u['name']} ({u['email']}) — rol: {u['role']}")
+        return
+
+    st.subheader("Iniciar sesión")
+    with st.form("login_form", clear_on_submit=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            email = st.text_input("Email")
+        with col2:
+            pwd = st.text_input("Contraseña", type="password")
+        remember = st.checkbox("Recordarme (guardar enlace con token)")
+        submit = st.form_submit_button("Entrar")
+
+    if submit:
+        if not email or not pwd:
+            st.error("Ingresa email y contraseña.")
+            return
+        authu = authenticate(email, pwd)
+        if not authu:
+            st.error("Credenciales inválidas o usuario inactivo.")
+            return
+
+        _set_user(authu)
+        st.success(f"Bienvenido, {authu['name']}")
+
+        if remember:
+            res = find_user_by_email(email)
+            if res:
+                uid, _ = res
+                raw = create_login_token(uid)
+                _set_query_params(tk=raw)
+                st.info("Se añadió ?tk=... en la URL. Guarda el enlace como marcador.")
+
+def logout_button(label: str = "Cerrar sesión"):
+    """Botón de cierre de sesión (si hay usuario)."""
+    u = current_user()
+    if not u:
+        return
+    if st.button(label):
+        _set_user(None)
+        _set_query_params()   # limpia parámetros (como tk)
+        st.experimental_rerun()
+
