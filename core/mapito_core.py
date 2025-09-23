@@ -248,4 +248,3 @@ def build_map(
         "n_selected": len(selected_fc["features"]) if (selected_fc and selected_fc.get("features")) else 0,
     }
     return m.get_root().render(), meta
-
