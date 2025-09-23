@@ -268,9 +268,13 @@ if app == "Mougli":
             st.error(f"Ocurrió un error procesando: {e}")
 
 # =============== M A P I T O ===============
-elif app == "Mapito" and build_map is not None:
+else:
+    import streamlit as st
+    from core.mapito_core import build_map, build_hierarchy, export_png
+
     st.markdown("## Mapito – Perú")
 
+    # ====== Controles =========
     st.sidebar.markdown("### Estilos del mapa")
     color_general = st.sidebar.color_picker("Color general", "#713030")
     color_sel = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
@@ -279,18 +283,106 @@ elif app == "Mapito" and build_map is not None:
     show_borders = st.sidebar.checkbox("Mostrar bordes", value=True)
     show_basemap = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
 
+    st.sidebar.markdown("### Fondo del mapa (vista)")
+    fondo_transp_vista = st.sidebar.checkbox("Fondo transparente (vista)", value=False)
+    fondo_color_vista = st.sidebar.color_picker("Color de fondo (vista)", "#e6f2f5")
+
+    st.sidebar.markdown("### PNG de salida")
+    png_transparente = st.sidebar.checkbox("PNG SIN fondo (transparente)", value=True)
+    png_color_fondo = st.sidebar.color_picker("Color de fondo del PNG", "#ffffff")
+    recortar_a_seleccion = st.sidebar.checkbox("Recortar a la selección", value=False)
+
+    # ====== Jerarquía ======
+    @st.cache_data(show_spinner=False)
+    def _cached_hierarchy(_data_dir: Path):
+        return build_hierarchy(_data_dir)
+
+    provincias_por_region, distritos_por_region_prov = _cached_hierarchy(DATA_DIR)
+
+    nivel = st.radio("Nivel", ["regiones", "provincias", "distritos"], horizontal=True, index=0)
+
+    # selección jerárquica
+    sel_reg = st.multiselect("Selecciona regiones a resaltar", sorted(provincias_por_region.keys()), default=["Ayacucho","Apurímac"])
+    # filtrar provincias por regiones elegidas
+    prov_choices = []
+    for r in sel_reg:
+        prov_choices += [(r, p) for p in provincias_por_region.get(r, [])]
+    prov_labels = [f"{r} — {p}" for (r, p) in prov_choices]
+    sel_prov_labels = st.multiselect("Selecciona provincias (se limitan por regiones)", prov_labels, default=[])
+    sel_prov = []
+    label_to_tuple = {f"{r} — {p}": (r, p) for (r, p) in prov_choices}
+    for lab in sel_prov_labels:
+        if lab in label_to_tuple:
+            sel_prov.append(label_to_tuple[lab])
+
+    # distritos limitados por provincias seleccionadas
+    dist_choices = []
+    for rp in sel_prov:
+        dist_choices += [(rp[0], rp[1], d) for d in distritos_por_region_prov.get((rp[0], rp[1]), [])]
+    dist_labels = [f"{r} — {p} — {d}" for (r, p, d) in dist_choices]
+    sel_dist_labels = st.multiselect("Selecciona distritos (se limitan por provincias)", dist_labels, default=[])
+    sel_dist = []
+    lab_to_dist = {f"{r} — {p} — {d}": (r, p, d) for (r, p, d) in dist_choices}
+    for lab in sel_dist_labels:
+        if lab in lab_to_dist:
+            sel_dist.append(lab_to_dist[lab])
+
+    # ====== Render Folium ======
     try:
-        html, seleccion = build_map(
+        html, _ = build_map(
             data_dir=DATA_DIR,
-            nivel="regiones",
+            nivel=nivel,
             colores={"fill": color_general, "selected": color_sel, "border": color_borde},
             style={"weight": grosor, "show_borders": show_borders, "show_basemap": show_basemap},
+            selected_regions=sel_reg,
+            selected_provinces=sel_prov,
+            selected_districts=sel_dist,
+            crop_to_selection=recortar_a_seleccion,
+            background_color=None if fondo_transp_vista else fondo_color_vista,
         )
         st.components.v1.html(html, height=700, scrolling=False)
-        if seleccion:
-            st.caption(f"Elementos mostrados: {len(seleccion)}")
+
+        # ====== Botones de descarga ======
+        st.caption(f"Elementos resaltados: regiones={len(sel_reg)}, provincias={len(sel_prov)}, distritos={len(sel_dist)}")
+
+        colA, colB = st.columns(2)
+        with colA:
+            try:
+                png_bytes = export_png(
+                    DATA_DIR, nivel,
+                    selected_regions=sel_reg,
+                    selected_provinces=sel_prov,
+                    selected_districts=sel_dist,
+                    face_all=color_general,
+                    face_sel=color_sel,
+                    edge=color_borde,
+                    linewidth=grosor,
+                    transparent=True,
+                    crop_to_selection=recortar_a_seleccion,
+                )
+                st.download_button("⬇ PNG (SIN fondo)", data=png_bytes, file_name="mapa_sin_fondo.png", mime="image/png")
+            except Exception:
+                st.info("Instala **matplotlib** para habilitar la descarga PNG sin fondo.")
+
+        with colB:
+            try:
+                png_bytes2 = export_png(
+                    DATA_DIR, nivel,
+                    selected_regions=sel_reg,
+                    selected_provinces=sel_prov,
+                    selected_districts=sel_dist,
+                    face_all=color_general,
+                    face_sel=color_sel,
+                    edge=color_borde,
+                    linewidth=grosor,
+                    transparent=False,
+                    bg_color=png_color_fondo,
+                    crop_to_selection=recortar_a_seleccion,
+                )
+                st.download_button("⬇ PNG (CON fondo)", data=png_bytes2, file_name="mapa_con_fondo.png", mime="image/png")
+            except Exception:
+                st.info("Instala **matplotlib** para habilitar la descarga PNG con fondo.")
+
     except Exception as e:
         st.error(f"No se pudo construir el mapa: {e}")
-else:
-    if build_map is None and app == "Mapito":
-        st.info("Mapito no está disponible en este entorno.")
+
