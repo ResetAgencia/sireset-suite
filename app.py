@@ -1,8 +1,9 @@
-# app.py — versión robusta para cambios en mougli_core y mapito_core
+# app.py — robusto (Mougli + Mapito), Excel siempre válido y copiar PNG al portapapeles
 
 import streamlit as st
 from pathlib import Path
 import pandas as pd
+import base64
 
 st.set_page_config(page_title="SiReset", layout="wide")
 
@@ -18,7 +19,7 @@ DATA_DIR = next((p for p in DATA_DIR_CANDIDATES if p.exists()), Path("data"))
 # ========= Encabezado =========
 st.image("assets/Encabezado.png", use_container_width=True)
 
-# ========= Importar MÓDULOS completos (robusto) =========
+# ========= Importar MÓDULOS completos (robustos a cambios) =========
 # Mougli
 try:
     import core.mougli_core as mcore
@@ -46,24 +47,26 @@ def _fallback_resumen(df, es_monitor: bool):
         return pd.DataFrame([{"Filas": 0, "Rango de fechas": "", "Marcas / Anunciantes": 0}])
     return pd.DataFrame([{"Filas": len(df), "Rango de fechas": "", "Marcas / Anunciantes": 0}])
 
-def _fallback_read_monitor_txt(file):
-    return pd.DataFrame()
-
-def _fallback_read_out(file):
-    return pd.DataFrame()
+def _fallback_read_monitor_txt(file): return pd.DataFrame()
+def _fallback_read_out(file): return pd.DataFrame()
 
 def _fallback_proc_monitor_outview(monitor_file, out_file, factores, outview_factor=None):
-    # Minimal: devuelve df vacío + Excel vacío
+    """Siempre devuelve un XLSX válido con hoja 'Resumen' (aunque no haya datos)."""
     from io import BytesIO
-    return pd.DataFrame(), BytesIO()
+    xlsx = BytesIO()
+    with pd.ExcelWriter(xlsx, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
+        pd.DataFrame(
+            [{"Descripción":"Aviso", "Valor":"Este es un archivo de ejemplo (fallback). Actualiza core/mougli_core.py"}]
+        ).to_excel(w, index=False, sheet_name="Resumen")
+    xlsx.seek(0)
+    return pd.DataFrame(), xlsx
 
-# Asigna funciones (módulo o fallback)
 procesar_monitor_outview = _safe(mcore, "procesar_monitor_outview", _fallback_proc_monitor_outview)
 resumen_mougli         = _safe(mcore, "resumen_mougli", _fallback_resumen)
 _read_monitor_txt      = _safe(mcore, "_read_monitor_txt", _fallback_read_monitor_txt)
 _read_out_robusto      = _safe(mcore, "_read_out_robusto", _fallback_read_out)
 
-# Manejo de factores persistentes (si el módulo no trae load/save, usa session_state)
+# Persistencia de factores (si no existen en el módulo, usa session_state)
 load_monitor_factors = getattr(mcore, "load_monitor_factors", None)
 save_monitor_factors = getattr(mcore, "save_monitor_factors", None)
 load_outview_factor  = getattr(mcore, "load_outview_factor",  None)
@@ -77,33 +80,26 @@ def _get_monitor_factors():
                 return {**DEFAULT_FACTORS, **val}
         except Exception:
             pass
-    # session fallback
     if "mfactors" not in st.session_state:
         st.session_state.mfactors = DEFAULT_FACTORS.copy()
     return st.session_state.mfactors
 
 def _set_monitor_factors(d):
     if callable(save_monitor_factors):
-        try:
-            save_monitor_factors(d); return
-        except Exception:
-            pass
+        try: save_monitor_factors(d); return
+        except Exception: pass
     st.session_state.mfactors = d
 
 def _get_out_factor():
     if callable(load_outview_factor):
-        try:
-            v = float(load_outview_factor()); return v
-        except Exception:
-            pass
+        try: return float(load_outview_factor())
+        except Exception: pass
     return float(st.session_state.get("out_factor", DEFAULT_OUT_FACTOR))
 
 def _set_out_factor(v: float):
     if callable(save_outview_factor):
-        try:
-            save_outview_factor(float(v)); return
-        except Exception:
-            pass
+        try: save_outview_factor(float(v)); return
+        except Exception: pass
     st.session_state.out_factor = float(v)
 
 # ========= Fallbacks Mapito =========
@@ -115,8 +111,7 @@ def _fallback_try_import_matplotlib():
         return False
 
 def _fallback_available_names(gj, name_key=None):
-    if name_key is None:
-        name_key = "NAME_1"
+    if name_key is None: name_key = "NAME_1"
     vals = [str(f["properties"].get(name_key, "")).strip() for f in gj.get("features", [])]
     return sorted({v for v in vals if v})
 
@@ -150,13 +145,12 @@ build_hierarchy        = _safe(mapito, "build_hierarchy_indices", _fallback_buil
 _load_geojson          = getattr(mapito, "_load_geojson", None)
 build_map              = getattr(mapito, "build_map", None)
 export_png             = getattr(mapito, "export_png_from_geojson", None)
-export_csv_names       = getattr(mapito, "export_csv_names", lambda names, header="nombre": pd.DataFrame({header:list(names)}).to_csv(index=False).encode("utf-8"))
 
 if _load_geojson is None or build_map is None:
-    st.error("Tu 'core/mapito_core.py' está desactualizado. Sube la versión nueva que expone '_load_geojson' y 'build_map'.")
+    st.error("Actualiza 'core/mapito_core.py' (debe exponer _load_geojson y build_map).")
     st.stop()
 
-# ========= App switcher =========
+# ========= Selector de app =========
 app = st.sidebar.radio("Elige aplicación", ["Mougli", "Mapito"], index=0)
 
 # ======================================================================
@@ -237,14 +231,17 @@ if app == "Mougli":
 
     if st.button("Procesar Mougli", type="primary"):
         try:
-            # Llamada tolerante a diferentes firmas
             try:
-                df_result, xlsx = procesar_monitor_outview(up_monitor, up_out,
-                                                          factores={"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios},
-                                                          outview_factor=out_factor)
+                df_result, xlsx = procesar_monitor_outview(
+                    up_monitor, up_out,
+                    factores={"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios},
+                    outview_factor=out_factor,
+                )
             except TypeError:
-                df_result, xlsx = procesar_monitor_outview(up_monitor, up_out,
-                                                          factores={"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios})
+                df_result, xlsx = procesar_monitor_outview(
+                    up_monitor, up_out,
+                    factores={"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios},
+                )
 
             st.success("¡Listo! ✅")
 
@@ -268,17 +265,22 @@ if app == "Mougli":
             if issues:
                 st.warning("⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues))
 
-            st.download_button("Descargar Excel", data=xlsx.getvalue(),
-                               file_name="SiReset_Mougli.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            # Descarga Excel (siempre válido; el fallback ya genera uno correcto)
+            st.download_button(
+                "Descargar Excel",
+                data=xlsx.getvalue(),
+                file_name="SiReset_Mougli.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
             st.markdown("### Vista previa")
             st.dataframe(df_result.head(100), use_container_width=True)
+
         except Exception as e:
             st.error(f"Ocurrió un error procesando: {e}")
 
 # ======================================================================
-# M A P I T O (UX jerárquica)
+# M A P I T O — PNGs + COPIAR PNG (sin fondo)
 # ======================================================================
 else:
     st.markdown("## Mapito – Perú")
@@ -292,15 +294,9 @@ else:
     show_borders = st.sidebar.checkbox("Mostrar bordes", value=True)
     show_basemap = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
 
-    # Exportación
-    st.sidebar.markdown("### Exportación")
-    png_transparent = st.sidebar.checkbox("PNG sin fondo (transparente)", value=True)
-    bg_color = None
-    if not png_transparent:
-        bg_color = st.sidebar.color_picker("Color de fondo del PNG", "#FFFFFF")
     have_mpl = _try_import_matplotlib()
     if not have_mpl:
-        st.sidebar.info("Para exportar PNG instala: `pip install matplotlib`")
+        st.sidebar.info("Para exportar/ copiar PNG instala: `pip install matplotlib`")
 
     # Cargar geojsons
     try:
@@ -311,9 +307,10 @@ else:
         st.error(f"No se pudieron cargar los GeoJSON: {e}")
         st.stop()
 
+    # Índices jerárquicos
     idx = build_hierarchy(gj_reg, gj_prov, gj_dist)
 
-    # Selectores jerárquicos
+    # Selectores en cascada
     st.caption("Selecciona por niveles (las opciones se filtran automáticamente).")
     colR, colP, colD = st.columns(3)
 
@@ -335,8 +332,12 @@ else:
         dist_opts = available_names(gj_dist, idx["k3"])
     sel_dist = colD.multiselect("Distritos", options=dist_opts, default=[], help="Se filtran por provincias elegidas")
 
+    # Chips
     def chips(lst):
-        return " ".join(f"<span style='display:inline-block;padding:6px 10px;margin:0 6px 6px 0;border-radius:16px;background:#efefef'>{s}</span>" for s in lst)
+        return " ".join(
+            f"<span style='display:inline-block;padding:6px 10px;margin:0 6px 6px 0;border-radius:16px;background:#efefef'>{s}</span>"
+            for s in lst
+        )
     if sel_reg:  st.markdown("**Regiones:** " + chips(sel_reg),  unsafe_allow_html=True)
     if sel_prov: st.markdown("**Provincias:** " + chips(sel_prov), unsafe_allow_html=True)
     if sel_dist: st.markdown("**Distritos:** " + chips(sel_dist), unsafe_allow_html=True)
@@ -360,39 +361,80 @@ else:
         st.components.v1.html(html, height=700, scrolling=False)
         st.caption(f"Mostrando: **{draw_level}** — resaltados: {len(seleccion_norm)}")
 
-        # Descargas
-        colA, colB, colC = st.columns(3)
-        with colA:
-            csv_bytes = export_csv_names(seleccion_norm or available_names(gj_draw, name_key), header=name_key)
-            st.download_button("⬇ CSV (mostrado)", data=csv_bytes, file_name=f"{draw_level}.csv", mime="text/csv")
-
+        # ───── Exportación PNG + Copiar PNG (sin fondo) ─────
         if have_mpl and export_png is not None:
+            # PNG transparente
+            png_bytes_transp = export_png(
+                gj_draw,
+                seleccion=seleccion_norm,
+                name_key=name_key,
+                color_fill=color_general,
+                color_selected=color_sel,
+                color_border=color_borde,
+                background=None,
+            )
+            # PNG con fondo blanco
+            png_bytes_bg = export_png(
+                gj_draw,
+                seleccion=seleccion_norm,
+                name_key=name_key,
+                color_fill=color_general,
+                color_selected=color_sel,
+                color_border=color_borde,
+                background="#FFFFFF",
+            )
+
+            colA, colB, colC = st.columns(3)
+            with colA:
+                st.download_button(
+                    "⬇ PNG (transparente)",
+                    data=png_bytes_transp,
+                    file_name=f"mapito_{draw_level}_transp.png",
+                    mime="image/png",
+                )
             with colB:
-                png_bytes = export_png(
-                    gj_draw,
-                    seleccion=seleccion_norm,
-                    name_key=name_key,
-                    color_fill=color_general,
-                    color_selected=color_sel,
-                    color_border=color_borde,
-                    background=None if png_transparent else bg_color,
+                st.download_button(
+                    "⬇ PNG (con fondo)",
+                    data=png_bytes_bg,
+                    file_name=f"mapito_{draw_level}_fondo.png",
+                    mime="image/png",
                 )
-                fname = f"mapito_{draw_level}_{'transp' if png_transparent else 'fondo'}.png"
-                st.download_button("⬇ PNG (actual)", data=png_bytes, file_name=fname, mime="image/png")
-            with colC:
-                png_bytes_alt = export_png(
-                    gj_draw,
-                    seleccion=seleccion_norm,
-                    name_key=name_key,
-                    color_fill=color_general,
-                    color_selected=color_sel,
-                    color_border=color_borde,
-                    background="#FFFFFF" if png_transparent else None,
-                )
-                altname = f"mapito_{draw_level}_{'fondo' if png_transparent else 'transp'}.png"
-                st.download_button("⬇ PNG (alterno)", data=png_bytes_alt, file_name=altname, mime="image/png")
+
+            # Botón COPIAR PNG (siempre usa el transparente)
+            b64_png = base64.b64encode(png_bytes_transp).decode("ascii")
+            st.components.v1.html(
+                f"""
+                <div style="position:relative;height:0">
+                  <button
+                    id="copyPngBtn"
+                    style="
+                      position:fixed; right:22px; top:120px; z-index:9999;
+                      background:#111; color:white; border:none; border-radius:10px;
+                      padding:10px 14px; font-weight:600; cursor:pointer; box-shadow:0 6px 16px rgba(0,0,0,.2);
+                    "
+                    title="Copiar PNG (sin fondo) al portapapeles"
+                  >📋 Copiar PNG</button>
+                </div>
+                <script>
+                  const dataUrl = "data:image/png;base64,{b64_png}";
+                  async function copyPng() {{
+                    try {{
+                      const res = await fetch(dataUrl);
+                      const blob = await res.blob();
+                      await navigator.clipboard.write([new ClipboardItem({{'image/png': blob}})]);
+                      alert("¡Imagen copiada! Ahora pégala donde quieras (Ctrl+V).");
+                    }} catch (err) {{
+                      alert("No se pudo copiar la imagen. Abre la app en HTTPS o permite acceso al portapapeles.");
+                    }}
+                  }}
+                  document.getElementById('copyPngBtn').addEventListener('click', copyPng);
+                </script>
+                """,
+                height=0,
+            )
         else:
-            st.info("Instala `matplotlib` para habilitar las descargas PNG.")
+            st.info("Instala `matplotlib` para habilitar las descargas y copiar PNG.")
 
     except Exception as e:
         st.error(f"No se pudo construir el mapa: {e}")
+
