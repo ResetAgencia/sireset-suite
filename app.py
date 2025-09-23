@@ -1,4 +1,6 @@
-# app.py — robusto (Mougli + Mapito), Excel siempre válido y copiar PNG al portapapeles
+# app.py — SiReset Suite (Mougli + Mapito)
+# - Mougli robusto (alias + fallbacks) y Excel siempre válido
+# - Mapito con PNG (transparente / con fondo) + Copiar PNG al portapapeles
 
 import streamlit as st
 from pathlib import Path
@@ -19,26 +21,22 @@ DATA_DIR = next((p for p in DATA_DIR_CANDIDATES if p.exists()), Path("data"))
 # ========= Encabezado =========
 st.image("assets/Encabezado.png", use_container_width=True)
 
-# ========= Importar MÓDULOS completos (robustos a cambios) =========
-# Mougli
+# ========= Importar MÓDULOS =========
 try:
     import core.mougli_core as mcore
 except Exception as e:
     st.error(f"No se pudo cargar 'core.mougli_core': {e}")
     st.stop()
 
-# Mapito
 try:
     import core.mapito_core as mapito
 except Exception as e:
     st.error(f"No se pudo cargar 'core.mapito_core': {e}")
     st.stop()
 
-def _safe(module, name, fallback):
-    """Devuelve module.name si existe, si no usa fallback."""
-    return getattr(module, name, fallback)
+# ----------------------------------------------------------------------
+# ===== BLOQUE MOUGLI ROBUSTO (alias + fallbacks) =====
 
-# ========= Fallbacks Mougli =========
 DEFAULT_FACTORS = {"TV": 0.26, "CABLE": 0.42, "RADIO": 0.42, "REVISTA": 0.15, "DIARIOS": 0.15}
 DEFAULT_OUT_FACTOR = 1.25
 
@@ -47,24 +45,61 @@ def _fallback_resumen(df, es_monitor: bool):
         return pd.DataFrame([{"Filas": 0, "Rango de fechas": "", "Marcas / Anunciantes": 0}])
     return pd.DataFrame([{"Filas": len(df), "Rango de fechas": "", "Marcas / Anunciantes": 0}])
 
-def _fallback_read_monitor_txt(file): return pd.DataFrame()
-def _fallback_read_out(file): return pd.DataFrame()
+def _fallback_read_monitor_txt(file):  # lector vacío
+    return pd.DataFrame()
+
+def _fallback_read_out(file):          # lector vacío
+    return pd.DataFrame()
 
 def _fallback_proc_monitor_outview(monitor_file, out_file, factores, outview_factor=None):
-    """Siempre devuelve un XLSX válido con hoja 'Resumen' (aunque no haya datos)."""
+    """
+    Siempre devuelve un XLSX válido con hoja 'Resumen' (aunque no haya datos).
+    Evita 'archivo dañado' si el módulo real no está disponible.
+    """
     from io import BytesIO
     xlsx = BytesIO()
-    with pd.ExcelWriter(xlsx, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
+    with pd.ExcelWriter(xlsx, engine="xlsxwriter",
+                        datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
         pd.DataFrame(
-            [{"Descripción":"Aviso", "Valor":"Este es un archivo de ejemplo (fallback). Actualiza core/mougli_core.py"}]
+            [{"Descripción": "Aviso",
+              "Valor": "Archivo de ejemplo (fallback). Actualiza core/mougli_core.py"}]
         ).to_excel(w, index=False, sheet_name="Resumen")
     xlsx.seek(0)
     return pd.DataFrame(), xlsx
 
-procesar_monitor_outview = _safe(mcore, "procesar_monitor_outview", _fallback_proc_monitor_outview)
-resumen_mougli         = _safe(mcore, "resumen_mougli", _fallback_resumen)
-_read_monitor_txt      = _safe(mcore, "_read_monitor_txt", _fallback_read_monitor_txt)
-_read_out_robusto      = _safe(mcore, "_read_out_robusto", _fallback_read_out)
+def _first_attr(module, names):
+    for n in names:
+        fn = getattr(module, n, None)
+        if callable(fn):
+            return fn
+    return None
+
+# 1) Lectores (alias nuevos/viejos)
+_read_monitor_txt = (
+    _first_attr(mcore, ["_read_monitor_txt", "_read_txt_robusto", "read_monitor_txt", "read_monitor"])
+    or _fallback_read_monitor_txt
+)
+_read_out_robusto = (
+    _first_attr(mcore, ["_read_out_robusto", "_read_out", "read_out"])
+    or _fallback_read_out
+)
+
+# 2) Resumen (algunas versiones no aceptan es_monitor)
+_raw_resumen = getattr(mcore, "resumen_mougli", None)
+if callable(_raw_resumen):
+    def resumen_mougli(df, es_monitor: bool):
+        try:
+            return _raw_resumen(df, es_monitor=es_monitor)
+        except TypeError:
+            return _raw_resumen(df)
+else:
+    resumen_mougli = _fallback_resumen
+
+# 3) Procesar principal (alias)
+procesar_monitor_outview = (
+    _first_attr(mcore, ["procesar_monitor_outview", "procesar", "run_mougli"])
+    or _fallback_proc_monitor_outview
+)
 
 # Persistencia de factores (si no existen en el módulo, usa session_state)
 load_monitor_factors = getattr(mcore, "load_monitor_factors", None)
@@ -86,29 +121,41 @@ def _get_monitor_factors():
 
 def _set_monitor_factors(d):
     if callable(save_monitor_factors):
-        try: save_monitor_factors(d); return
-        except Exception: pass
+        try:
+            save_monitor_factors(d); return
+        except Exception:
+            pass
     st.session_state.mfactors = d
 
 def _get_out_factor():
     if callable(load_outview_factor):
-        try: return float(load_outview_factor())
-        except Exception: pass
+        try:
+            return float(load_outview_factor())
+        except Exception:
+            pass
     return float(st.session_state.get("out_factor", DEFAULT_OUT_FACTOR))
 
 def _set_out_factor(v: float):
     if callable(save_outview_factor):
-        try: save_outview_factor(float(v)); return
-        except Exception: pass
+        try:
+            save_outview_factor(float(v)); return
+        except Exception:
+            pass
     st.session_state.out_factor = float(v)
 
-# ========= Fallbacks Mapito =========
-def _fallback_try_import_matplotlib():
+# ===== FIN BLOQUE MOUGLI ROBUSTO =====
+# ----------------------------------------------------------------------
+
+# ========= Fallbacks Mapito / helpers =========
+def _try_import_matplotlib():
     try:
         import matplotlib  # noqa
         return True
     except Exception:
         return False
+
+def _safe(module, name, fallback):
+    return getattr(module, name, fallback)
 
 def _fallback_available_names(gj, name_key=None):
     if name_key is None: name_key = "NAME_1"
@@ -118,7 +165,8 @@ def _fallback_available_names(gj, name_key=None):
 def _fallback_build_hierarchy_indices(gj_reg, gj_prov, gj_dist):
     def name_key(gj, pref):
         props0 = gj["features"][0]["properties"] if gj.get("features") else {}
-        return pref if pref in props0 else next((k for k in ("NAME_3","NAME_2","NAME_1","NAME_0") if k in props0), list(props0)[0] if props0 else "NAME_1")
+        return pref if pref in props0 else next((k for k in ("NAME_3","NAME_2","NAME_1","NAME_0") if k in props0),
+                                                list(props0)[0] if props0 else "NAME_1")
     k1 = name_key(gj_reg, "NAME_1"); k2 = name_key(gj_prov, "NAME_2"); k3 = name_key(gj_dist, "NAME_3")
     prov_to_reg, dist_to_prov, dist_to_reg = {}, {}, {}
     for f in gj_prov.get("features", []):
@@ -139,7 +187,6 @@ def _fallback_build_hierarchy_indices(gj_reg, gj_prov, gj_dist):
     return {"k1": k1, "k2": k2, "k3": k3, "prov_to_reg": prov_to_reg, "dist_to_prov": dist_to_prov,
             "dist_to_reg": dist_to_reg, "reg_to_provs": reg_to_provs, "prov_to_dists": prov_to_dists}
 
-_try_import_matplotlib = _safe(mapito, "_try_import_matplotlib", _fallback_try_import_matplotlib)
 available_names        = _safe(mapito, "available_names", _fallback_available_names)
 build_hierarchy        = _safe(mapito, "build_hierarchy_indices", _fallback_build_hierarchy_indices)
 _load_geojson          = getattr(mapito, "_load_geojson", None)
@@ -163,7 +210,7 @@ if app == "Mougli":
 
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        f_tv = st.number_input("TV",     min_value=0.0, step=0.01, value=float(mf.get("TV", 0.26)))
+        f_tv    = st.number_input("TV",     min_value=0.0, step=0.01, value=float(mf.get("TV", 0.26)))
         f_cable = st.number_input("CABLE",  min_value=0.0, step=0.01, value=float(mf.get("CABLE", 0.42)))
         f_radio = st.number_input("RADIO",  min_value=0.0, step=0.01, value=float(mf.get("RADIO", 0.42)))
     with col2:
@@ -186,11 +233,13 @@ if app == "Mougli":
         st.caption("Sube OutView (.csv / .xlsx)")
         up_out = st.file_uploader("Drag and drop file here", type=["csv", "xlsx"], key="o_csv", label_visibility="collapsed")
 
-    BAD_TIPOS = {"INSERT","INTERNACIONAL","OBITUARIO","POLITICO","AUTOAVISO","PROMOCION CON AUSPICIO","PROMOCION SIN AUSPICIO"}
+    BAD_TIPOS = {"INSERT","INTERNACIONAL","OBITUARIO","POLITICO","AUTOAVISO",
+                 "PROMOCION CON AUSPICIO","PROMOCION SIN AUSPICIO"}
 
     def _unique_list_str(series, max_items=50):
         if series is None: return "—"
-        vals = (series.astype(str).str.strip().replace({"nan": ""}).dropna().loc[lambda s: s.str.len()>0].unique().tolist())
+        vals = (series.astype(str).str.strip().replace({"nan": ""}).dropna()
+                .loc[lambda s: s.str.len()>0].unique().tolist())
         if not vals: return "—"
         vals = sorted(set(vals))
         return ", ".join(vals[:max_items]) + (f" … (+{len(vals)-max_items} más)" if len(vals)>max_items else "")
@@ -200,10 +249,12 @@ if app == "Mougli":
         if base is None or base.empty:
             base = pd.DataFrame([{"Filas": 0, "Rango de fechas": "—", "Marcas / Anunciantes": 0}])
         base_vertical = pd.DataFrame({"Descripción": base.columns, "Valor": base.iloc[0].tolist()})
+
         cat_col = "CATEGORIA" if es_monitor else ("Categoría" if (df is not None and "Categoría" in getattr(df, "columns", [])) else None)
         reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if (df is not None and "Región" in getattr(df, "columns", [])) else None)
         tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
         tipo_col = next((c for c in tipo_cols if (df is not None and c in getattr(df, "columns", []))), None)
+
         extras = []
         if df is not None and not df.empty:
             if cat_col: extras.append({"Descripción": "Categorías (únicas)", "Valor": _unique_list_str(df[cat_col])})
@@ -223,7 +274,7 @@ if app == "Mougli":
             malos = sorted(set([t for t in tipos.unique() if t in BAD_TIPOS]))
             if malos: alerts.append("Se detectaron valores en TIPO ELEMENTO: " + ", ".join(malos))
         reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if "Región" in df.columns else None)
-        if reg_col:
+        if reg_col and reg_col in df.columns:
             regiones = df[reg_col].astype(str).str.upper().str.strip().replace({"NAN": ""}).dropna()
             fuera = sorted(set([r for r in regiones.unique() if r and r != "LIMA"]))
             if fuera: alerts.append("Regiones distintas de LIMA detectadas: " + ", ".join(fuera))
@@ -265,7 +316,6 @@ if app == "Mougli":
             if issues:
                 st.warning("⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues))
 
-            # Descarga Excel (siempre válido; el fallback ya genera uno correcto)
             st.download_button(
                 "Descargar Excel",
                 data=xlsx.getvalue(),
@@ -288,19 +338,19 @@ else:
     # Estilos
     st.sidebar.markdown("### Estilos del mapa")
     color_general = st.sidebar.color_picker("Color general", "#713030")
-    color_sel = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
-    color_borde = st.sidebar.color_picker("Color de borde", "#000000")
-    grosor = st.sidebar.slider("Grosor de borde", 0.1, 2.0, 0.8, 0.05)
-    show_borders = st.sidebar.checkbox("Mostrar bordes", value=True)
-    show_basemap = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
+    color_sel     = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
+    color_borde   = st.sidebar.color_picker("Color de borde", "#000000")
+    grosor        = st.sidebar.slider("Grosor de borde", 0.1, 2.0, 0.8, 0.05)
+    show_borders  = st.sidebar.checkbox("Mostrar bordes", value=True)
+    show_basemap  = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
 
     have_mpl = _try_import_matplotlib()
     if not have_mpl:
-        st.sidebar.info("Para exportar/ copiar PNG instala: `pip install matplotlib`")
+        st.sidebar.info("Para exportar/ copiar PNG instala: `pip install matplotlib pillow`")
 
     # Cargar geojsons
     try:
-        gj_reg = _load_geojson(DATA_DIR, "regiones")
+        gj_reg  = _load_geojson(DATA_DIR, "regiones")
         gj_prov = _load_geojson(DATA_DIR, "provincias")
         gj_dist = _load_geojson(DATA_DIR, "distritos")
     except Exception as e:
@@ -400,7 +450,7 @@ else:
                     mime="image/png",
                 )
 
-            # Botón COPIAR PNG (siempre usa el transparente)
+            # Botón COPIAR PNG (usa el transparente)
             b64_png = base64.b64encode(png_bytes_transp).decode("ascii")
             st.components.v1.html(
                 f"""
@@ -424,7 +474,7 @@ else:
                       await navigator.clipboard.write([new ClipboardItem({{'image/png': blob}})]);
                       alert("¡Imagen copiada! Ahora pégala donde quieras (Ctrl+V).");
                     }} catch (err) {{
-                      alert("No se pudo copiar la imagen. Abre la app en HTTPS o permite acceso al portapapeles.");
+                      alert("No se pudo copiar la imagen. Usa HTTPS o permite acceso al portapapeles.");
                     }}
                   }}
                   document.getElementById('copyPngBtn').addEventListener('click', copyPng);
@@ -433,8 +483,7 @@ else:
                 height=0,
             )
         else:
-            st.info("Instala `matplotlib` para habilitar las descargas y copiar PNG.")
+            st.info("Instala `matplotlib` y `pillow` para habilitar las descargas y copiar PNG.")
 
     except Exception as e:
         st.error(f"No se pudo construir el mapa: {e}")
-
