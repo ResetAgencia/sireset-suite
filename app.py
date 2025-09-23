@@ -1,5 +1,3 @@
-import io
-import json
 import streamlit as st
 from pathlib import Path
 
@@ -7,10 +5,14 @@ from pathlib import Path
 from core.mougli_core import (
     procesar_monitor_outview,
     resumen_mougli,
-    _read_monitor_txt,   # <- corrección: usar el lector real de Monitor
-    _read_out_robusto    # <- ya existía; lo reutilizamos para el resumen
+    _read_monitor_txt,
+    _read_out_robusto,
+    load_monitor_factors,
+    save_monitor_factors,
+    load_outview_factor,
+    save_outview_factor,
 )
-from core.mapito_core import build_map
+from core.mapito_core import build_map  # si no usas Mapito, puedes comentar esta línea
 
 # ---------- Config ----------
 st.set_page_config(page_title="SiReset", layout="wide")
@@ -19,8 +21,30 @@ DATA_DIR = Path("data")
 # ---------- Encabezado ----------
 st.image("assets/Encabezado.png", use_container_width=True)
 
-# ---------- Selector de app ----------
+# ---------- Sidebar: selector & ajustes ----------
 app = st.sidebar.radio("Elige aplicación", ["Mougli", "Mapito"], index=0)
+
+st.sidebar.markdown("### Factores")
+# Cargar persistentes
+persist_m = load_monitor_factors()
+persist_o = load_outview_factor()
+
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    f_tv = st.number_input("TV", min_value=0.0, step=0.01, value=float(persist_m.get("TV", 0.26)))
+    f_cable = st.number_input("CABLE", min_value=0.0, step=0.01, value=float(persist_m.get("CABLE", 0.42)))
+    f_radio = st.number_input("RADIO", min_value=0.0, step=0.01, value=float(persist_m.get("RADIO", 0.42)))
+with col2:
+    f_revista = st.number_input("REVISTA", min_value=0.0, step=0.01, value=float(persist_m.get("REVISTA", 0.15)))
+    f_diarios = st.number_input("DIARIOS", min_value=0.0, step=0.01, value=float(persist_m.get("DIARIOS", 0.15)))
+    out_factor = st.number_input("OutView ×Superficie", min_value=0.0, step=0.05, value=float(persist_o))
+
+factores = {"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios}
+
+if st.sidebar.button("💾 Guardar factores"):
+    save_monitor_factors(factores)
+    save_outview_factor(out_factor)
+    st.sidebar.success("Factores guardados.")
 
 # =============== M O U G L I ===============
 if app == "Mougli":
@@ -38,23 +62,16 @@ if app == "Mougli":
             "Drag and drop file here", type=["csv", "xlsx"], key="o_csv", label_visibility="collapsed"
         )
 
-    # --------- Factores SOLO en Mougli ----------
-    st.sidebar.markdown("### Factores (Monitor)")
-    f_tv = st.sidebar.number_input("TV", min_value=0.0, step=0.01, value=0.26)
-    f_cable = st.sidebar.number_input("CABLE", min_value=0.0, step=0.01, value=0.42)
-    f_radio = st.sidebar.number_input("RADIO", min_value=0.0, step=0.01, value=0.42)
-    f_revista = st.sidebar.number_input("REVISTA", min_value=0.0, step=0.01, value=0.15)
-    f_diarios = st.sidebar.number_input("DIARIOS", min_value=0.0, step=0.01, value=0.15)
-    factores = {"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios}
-
     st.write("")
     btn = st.button("Procesar Mougli", type="primary")
     if btn:
         try:
-            df_result, xlsx = procesar_monitor_outview(up_monitor, up_out, factores=factores)
+            df_result, xlsx = procesar_monitor_outview(
+                up_monitor, up_out, factores=factores, outview_factor=out_factor
+            )
             st.success("¡Listo! ✅")
 
-            # --- Resumen “doble” (usando los mismos lectores del core)
+            # --- Resumen “doble” (misma lógica del core)
             colA, colB = st.columns(2)
             with colA:
                 st.markdown("#### Monitor")
@@ -73,7 +90,7 @@ if app == "Mougli":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            # Vista rápida del resultado principal (Consolidado si existe; si no, Monitor)
+            # Vista rápida (Consolidado si existe)
             st.markdown("### Vista previa")
             st.dataframe(df_result.head(100), use_container_width=True)
 
@@ -104,4 +121,3 @@ else:
             st.caption(f"Elementos mostrados: {len(seleccion)}")
     except Exception as e:
         st.error(f"No se pudo construir el mapa: {e}")
-
