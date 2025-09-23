@@ -1,549 +1,273 @@
+from __future__ import annotations
+
+from pathlib import Path
 import io
 import json
-from io import BytesIO
-from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Iterable, List, Tuple, Optional, Dict, Set
 
-import numpy as np
-import pandas as pd
-
-# ───────────────────────────── Config persistente ─────────────────────────────
-APP_DIR = Path(__file__).parent
-CONFIG_PATH = APP_DIR / "factores_config.json"
-
-_DEFAULT_MONITOR = {"TV": 0.255, "CABLE": 0.425, "RADIO": 0.425, "REVISTA": 0.14875, "DIARIOS": 0.14875}
-_DEFAULT_OUTVIEW = {"tarifa_superficie_factor": 1.25}
-
-def _load_cfg() -> dict:
-    if CONFIG_PATH.exists():
-        try:
-            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            cfg.setdefault("monitor", _DEFAULT_MONITOR.copy())
-            cfg.setdefault("outview", _DEFAULT_OUTVIEW.copy())
-            cfg["outview"].setdefault("tarifa_superficie_factor", 1.25)
-            return cfg
-        except Exception:
-            pass
-    cfg = {"monitor": _DEFAULT_MONITOR.copy(), "outview": _DEFAULT_OUTVIEW.copy()}
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    return cfg
-
-def load_monitor_factors() -> Dict[str, float]:
-    return _load_cfg().get("monitor", _DEFAULT_MONITOR.copy())
-
-def save_monitor_factors(f: Dict[str, float]) -> None:
-    cfg = _load_cfg()
-    cfg["monitor"] = {k: float(v) for k, v in f.items()}
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-
-def load_outview_factor() -> float:
-    return float(_load_cfg().get("outview", _DEFAULT_OUTVIEW)["tarifa_superficie_factor"])
-
-def save_outview_factor(v: float) -> None:
-    cfg = _load_cfg()
-    cfg.setdefault("outview", _DEFAULT_OUTVIEW.copy())
-    cfg["outview"]["tarifa_superficie_factor"] = float(v)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+import folium
+from folium import GeoJson
 
 
-# ───────────────────────── Utiles generales ─────────────────────────
-MESES_ES = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio",
-            "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
-
-def _decode_bytes(b: bytes) -> str:
-    for enc in ("utf-8-sig", "latin-1", "cp1252"):
-        try:
-            return b.decode(enc)
-        except Exception:
-            pass
-    raise ValueError("No fue posible decodificar el TXT (probé utf-8-sig, latin-1, cp1252).")
-
-def _col_letter(idx: int) -> str:
-    s = ""
-    n = idx
-    while n >= 0:
-        s = chr(n % 26 + 65) + s
-        n = n // 26 - 1
-    return s
+# ============ Folium → HTML ============
+def _folium_to_html(m: folium.Map) -> str:
+    return m.get_root().render()
 
 
-# ───────────────────────── Lectores de fuentes ──────────────────────
-def _read_monitor_txt(file) -> pd.DataFrame:
-    if file is None:
-        return pd.DataFrame()
+# ============ Carga robusta de GeoJSON ============
+def _load_geojson(data_dir: Path, nivel: str) -> dict:
+    """
+    Busca los datos en varias rutas:
+      1) data_dir/peru/{nivel}.json
+      2) data_dir/{nivel}.json
+      3) GADM mapeado:
+           regiones   → gadm41_PER_1.json
+           provincias → gadm41_PER_2.json
+           distritos  → gadm41_PER_3.json
+      4) lo mismo pero relativo a core/data
+    """
+    candidates: List[Path] = []
+    candidates.append(data_dir / "peru" / f"{nivel}.json")
+    candidates.append(data_dir / f"{nivel}.json")
 
-    raw = file.read()
-    text = _decode_bytes(raw) if isinstance(raw, (bytes, bytearray)) else raw
-    lines = text.splitlines()
+    gadm_map = {"regiones": "gadm41_PER_1.json", "provincias": "gadm41_PER_2.json", "distritos": "gadm41_PER_3.json"}
+    if nivel in gadm_map:
+        candidates.append(data_dir / gadm_map[nivel])
 
-    hdr_idx = None
-    for i, l in enumerate(lines[:60]):
-        if "|MEDIO|" in l.upper():
-            hdr_idx = i
-            break
-    if hdr_idx is None:
-        return pd.DataFrame({"linea": [l for l in lines if l.strip()]})
+    core_data = Path(__file__).parent / "data"
+    candidates.append(core_data / "peru" / f"{nivel}.json")
+    candidates.append(core_data / f"{nivel}.json")
+    if nivel in gadm_map:
+        candidates.append(core_data / gadm_map[nivel])
 
-    buf = io.StringIO("\n".join(lines[hdr_idx:]))
-    df = pd.read_csv(buf, sep="|", engine="python")
+    for p in candidates:
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
 
-    df.columns = df.columns.astype(str).str.strip()
-    df = df.dropna(axis=1, how="all")
-
-    first_col = df.columns[0]
-    if first_col.strip() in {"#", ""}:
-        df = df.drop(columns=[first_col])
-
-    cols_up = {c: c.upper() for c in df.columns}
-    df.rename(columns=cols_up, inplace=True)
-
-    if "DIA" in df.columns:
-        df["DIA"] = pd.to_datetime(df["DIA"], format="%d/%m/%Y", errors="coerce").dt.normalize()
-        df["AÑO"] = df["DIA"].dt.year
-        df["MES"] = df["DIA"].dt.month.apply(lambda m: MESES_ES[int(m)] if pd.notnull(m) and m>=1 and m<=12 else "")
-        df["SEMANA"] = df["DIA"].dt.isocalendar().week
-
-    if "MEDIO" in df.columns:
-        df["MEDIO"] = df["MEDIO"].astype(str).str.upper().str.strip()
-
-    if "INVERSION" in df.columns:
-        df["INVERSION"] = pd.to_numeric(df["INVERSION"], errors="coerce").fillna(0)
-
-    order = [c for c in ["DIA", "AÑO", "MES", "SEMANA"] if c in df.columns]
-    df = df[[*order] + [c for c in df.columns if c not in order]]
-    return df
+    tried = " | ".join(str(p) for p in candidates)
+    raise FileNotFoundError(f"No se encontró GeoJSON para '{nivel}'. Probé: {tried}")
 
 
-def _read_out_robusto(file) -> pd.DataFrame:
-    if file is None:
-        return pd.DataFrame()
-    name = (getattr(file, "name", "") or "").lower()
-    try:
-        if name.endswith(".csv"):
-            try:
-                file.seek(0)
-                return pd.read_csv(file)
-            except UnicodeDecodeError:
-                file.seek(0)
-                return pd.read_csv(file, sep=";", encoding="latin-1")
-        file.seek(0)
-        return pd.read_excel(file)
-    except Exception:
-        try:
-            file.seek(0)
-            return pd.read_csv(file, sep=";", encoding="latin-1")
-        except Exception:
-            file.seek(0)
-            return pd.read_excel(file)
+# ============ Helpers de nombres ============
+def _name_field_for_level(nivel: str, gj: dict | None = None) -> str:
+    preferred = {"regiones": "NAME_1", "provincias": "NAME_2", "distritos": "NAME_3"}
+    if gj is None:
+        return preferred.get(nivel, "NAME_1")
+    props0 = gj["features"][0]["properties"]
+    key = preferred.get(nivel)
+    if key and key in props0:
+        return key
+    for k in ("NAME_3", "NAME_2", "NAME_1", "NAME_0"):
+        if k in props0:
+            return k
+    for k, v in props0.items():
+        if isinstance(v, str):
+            return k
+    return list(props0.keys())[0]
 
 
-# ───────────────────────── Transformaciones ─────────────────────────
-def _aplicar_factores_monitor(df: pd.DataFrame, factores: Dict[str, float]) -> pd.DataFrame:
-    if df.empty or "MEDIO" not in df.columns or "INVERSION" not in df.columns:
-        return df
-    df = df.copy()
-
-    def fx(m):
-        m = (str(m) or "").upper().strip()
-        mapa = {
-            "TV": "TV", "TELEVISION": "TV",
-            "CABLE": "CABLE",
-            "RADIO": "RADIO",
-            "REVISTA": "REVISTA", "REVISTAS": "REVISTA",
-            "DIARIO": "DIARIOS", "DIARIOS": "DIARIOS", "PRENSA": "DIARIOS",
-        }
-        clave = mapa.get(m, None)
-        return float(factores.get(clave, 1.0)) if clave else 1.0
-
-    df["INVERSION"] = df.apply(lambda r: r["INVERSION"] * fx(r["MEDIO"]), axis=1)
-    return df
+def available_names(gj: dict, name_key: Optional[str] = None) -> List[str]:
+    if name_key is None:
+        name_key = _name_field_for_level("regiones", gj)
+    vals = [f["properties"].get(name_key, "") for f in gj["features"]]
+    return sorted({str(v).strip() for v in vals if str(v).strip()})
 
 
-def _version_column(df: pd.DataFrame) -> str | None:
-    for c in df.columns:
-        if str(c).lower().startswith("vers"):
-            return c
-    return None
+# ============ Índices jerárquicos ============
+def build_hierarchy_indices(gj_reg: dict, gj_prov: dict, gj_dist: dict) -> dict:
+    """Devuelve diccionarios para filtrar rápidamente."""
+    k1 = _name_field_for_level("regiones", gj_reg)
+    k2 = _name_field_for_level("provincias", gj_prov)
+    k3 = _name_field_for_level("distritos", gj_dist)
 
+    # province -> region
+    prov_to_reg: Dict[str, str] = {}
+    for f in gj_prov["features"]:
+        p = str(f["properties"].get(k2, "")).strip()
+        r = str(f["properties"].get("NAME_1", f["properties"].get(k1, ""))).strip()
+        if p and r:
+            prov_to_reg[p] = r
 
-def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -> pd.DataFrame:
-    """Replica los cálculos del 'basito' para OutView, incluyendo Tarifa Real ($)."""
-    if df is None or df.empty:
-        return pd.DataFrame()
+    # district -> province (+region mirror)
+    dist_to_prov: Dict[str, str] = {}
+    dist_to_reg: Dict[str, str] = {}
+    for f in gj_dist["features"]:
+        d = str(f["properties"].get(k3, "")).strip()
+        p = str(f["properties"].get("NAME_2", f["properties"].get(k2, ""))).strip()
+        r = str(f["properties"].get("NAME_1", "")).strip()
+        if d and p:
+            dist_to_prov[d] = p
+        if d and r:
+            dist_to_reg[d] = r
 
-    df = df.copy()
-    # Normalización de fecha y despieces
-    df["Fecha"] = pd.to_datetime(df.get("Fecha"), dayfirst=True, errors="coerce")
-    df["AÑO"] = df["Fecha"].dt.year
-    df["MES"] = df["Fecha"].dt.month.apply(lambda m: MESES_ES[int(m)] if pd.notnull(m) and 1 <= m <= 12 else "")
-    df["SEMANA"] = df["Fecha"].dt.isocalendar().week
-    df["_FechaDT"] = df["Fecha"]
-    df["_YM"] = df["_FechaDT"].dt.to_period("M")
+    # region -> set(provinces)
+    reg_to_provs: Dict[str, Set[str]] = {}
+    for p, r in prov_to_reg.items():
+        reg_to_provs.setdefault(r, set()).add(p)
 
-    safe = lambda v: "" if pd.isna(v) else str(v)
-    ver_col = _version_column(df)
+    # province -> set(districts)
+    prov_to_dists: Dict[str, Set[str]] = {}
+    for d, p in dist_to_prov.items():
+        prov_to_dists.setdefault(p, set()).add(d)
 
-    # Identificadores base
-    df["Código único"] = df.apply(lambda r: "|".join([
-        safe(r.get("MES","")), safe(r.get("AÑO","")), safe(r.get("Latitud","")), safe(r.get("Longitud","")),
-        safe(r.get("Avenida","")), safe(r.get("Nro Calle/Cuadra","")), safe(r.get("Marca","")),
-        safe(r.get("Tipo Elemento","")), safe(r.get("Orientación de Vía","")), safe(r.get("Tarifa S/.","")),
-        safe(r.get("Proveedor","")), safe(r.get("Distrito","")), safe(r.get("Cod.Proveedor",""))
-    ]), axis=1)
-
-    df["Código +1 pieza"] = df.apply(lambda r: "|".join([
-        safe(r.get("NombreBase","")), safe(r.get("Proveedor","")), safe(r.get("Tipo Elemento","")),
-        safe(r.get("Distrito","")), safe(r.get("Orientación de Vía","")), safe(r.get("Nro Calle/Cuadra","")),
-        safe(r.get("Item","")), safe(r.get(ver_col,"") if ver_col else ""),
-        safe(r.get("Latitud","")), safe(r.get("Longitud","")), safe(r.get("Categoría","")),
-        safe(r.get("Tarifa S/.","")), safe(r.get("Anunciante","")), safe(r.get("MES","")),
-        safe(r.get("AÑO","")), safe(r.get("SEMANA",""))
-    ]), axis=1)
-
-    # Métricas base
-    df["Denominador"] = df.groupby("Código único")["Código único"].transform("size")
-    if ver_col:
-        df["Q versiones por elemento Mes"] = df.groupby("Código único")[ver_col].transform("nunique")
-
-    df["+1 Superficie"] = df.groupby("Código +1 pieza")["Código +1 pieza"].transform("size")
-    tarifa_num = pd.to_numeric(df.get("Tarifa S/."), errors="coerce").fillna(0)
-    first_in_piece = (df.groupby("Código +1 pieza").cumcount() == 0)
-
-    # Tarifa × Superficie SOLO primera fila por pieza (para cálculo) con factor
-    df["Tarifa × Superficie"] = np.where(first_in_piece, tarifa_num * df["+1 Superficie"], 0.0)
-    # Ajuste por factor y dólar (3.8)
-    df["Tarifa × Superficie"] = (df["Tarifa × Superficie"] * float(factor_outview)) / 3.8
-
-    df["Semana en Mes por Código"] = (
-        df.groupby(["Código único","_YM"])["_FechaDT"].transform(lambda s: s.rank(method="dense").astype(int))
-    )
-    order_in_month = (
-        df.sort_values(["Código único","_YM","_FechaDT"]).groupby(["Código único","_YM"]).cumcount()
-    )
-    df["Conteo mensual"] = (order_in_month == 0).astype(int)
-
-    # Inversión: primera TxS por Código único / nº de piezas del código
-    df_pieces = df[df["Tarifa × Superficie"] != 0].sort_values(["Código único","_FechaDT"])
-    per_code_first = df_pieces.groupby("Código único")["Tarifa × Superficie"].first()
-    per_code_count = df_pieces.groupby("Código único")["Tarifa × Superficie"].size()
-    per_code_value = (per_code_first / per_code_count).astype(float)
-    df["Tarifa × Superficie (1ra por Código único)"] = df["Código único"].map(per_code_value)
-
-    # Columnas "Excel" (AB..AI y EXTRAE)
-    if "NombreBase" in df.columns:
-        s_nb = df["NombreBase"].astype(str)
-        df["NB_EXTRAE_6_7"] = s_nb.str.slice(5, 12)
-    else:
-        df["NB_EXTRAE_6_7"] = ""
-
-    def copy_or_empty(src, newname):
-        df[newname] = df[src] if src in df.columns else ""
-
-    copy_or_empty("Fecha", "Fecha_AB")
-    copy_or_empty("Proveedor", "Proveedor_AC")
-    copy_or_empty("Tipo Elemento", "TipoElemento_AD")
-    copy_or_empty("Distrito", "Distrito_AE")
-    copy_or_empty("Avenida", "Avenida_AF")
-    copy_or_empty("Nro Calle/Cuadra", "NroCalleCuadra_AG")
-    copy_or_empty("Orientación de Vía", "OrientacionVia_AH")
-    copy_or_empty("Marca", "Marca_AI")
-
-    # Conteos tipo CONTAR.SI.CONJUNTO
-    ab_ai_keys = ["Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
-                  "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
-    for c in ab_ai_keys:
-        if c not in df.columns:
-            df[c] = ""
-    counts = df.groupby(ab_ai_keys, dropna=False).size().reset_index(name="Conteo_AB_AI")
-    df = df.merge(counts, on=ab_ai_keys, how="left")
-
-    z_keys = ["NB_EXTRAE_6_7","Proveedor_AC","TipoElemento_AD","Distrito_AE",
-              "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
-    for c in z_keys:
-        if c not in df.columns:
-            df[c] = ""
-    counts2 = df.groupby(z_keys, dropna=False).size().reset_index(name="Conteo_Z_AB_AI")
-    df = df.merge(counts2, on=z_keys, how="left")
-
-    # TarifaS/3 y división por conteo
-    df["TarifaS_div3"] = tarifa_num / 3.0
-    df["TarifaS_div3_sobre_Conteo"] = df["TarifaS_div3"] / df["Conteo_AB_AI"].astype(float)
-
-    # SUMAR.SI.CONJUNTO(AM ; Z==AA ; D..N==AC..AI)
-    sum_keys = ["NB_EXTRAE_6_7","Proveedor","Tipo Elemento","Distrito",
-                "Avenida","Nro Calle/Cuadra","Orientación de Vía","Marca"]
-    for c in sum_keys:
-        if c not in df.columns:
-            df[c] = ""
-    sums = (
-        df.groupby(sum_keys, dropna=False)["TarifaS_div3_sobre_Conteo"]
-          .sum().reset_index(name="Suma_AM_Z_AB_AI")
-    )
-    df = df.merge(sums, on=sum_keys, how="left")
-
-    # Tope por Tipo
-    tipo_to_base = {
-        "BANDEROLA": 12000, "CLIP": 600, "MINIPOLAR": 1000, "PALETA": 600,
-        "PANEL": 1825, "PANEL CARRETERO": 5000, "PANTALLA LED": 5400,
-        "PARADERO": 800, "PRISMA": 2800, "QUIOSCO": 600, "RELOJ": 840,
-        "TORRE UNIPOLAR": 3000, "TOTEM": 950, "VALLA": 600, "VALLA ALTA": 1300
+    return {
+        "k1": k1,
+        "k2": k2,
+        "k3": k3,
+        "prov_to_reg": prov_to_reg,
+        "dist_to_prov": dist_to_prov,
+        "dist_to_reg": dist_to_reg,
+        "reg_to_provs": reg_to_provs,
+        "prov_to_dists": prov_to_dists,
     }
-    tipo_up = df.get("Tipo Elemento", "").astype(str).str.upper()
-    tope = tipo_up.map(tipo_to_base).astype(float) * (4.0/3.0)
-    df["TopeTipo_AQ"] = tope
-    an_val = pd.to_numeric(df["Suma_AM_Z_AB_AI"], errors="coerce")
-    df["Suma_AM_Topada_Tipo"] = np.where(np.isnan(tope), an_val, np.minimum(an_val, tope))
-
-    # División AO/AK y Tarifa Real ($)
-    denom = pd.to_numeric(df["Conteo_Z_AB_AI"], errors="coerce")
-    df["SumaTopada_div_ConteoZ"] = np.where(denom > 0,
-                                            pd.to_numeric(df["Suma_AM_Topada_Tipo"], errors="coerce") / denom,
-                                            0.0)
-    df["Tarifa Real ($)"] = np.where(
-        tipo_up == "PANTALLA LED",
-        df["SumaTopada_div_ConteoZ"] * 0.4,
-        df["SumaTopada_div_ConteoZ"] * 0.8
-    )
-
-    # Limpiezas solicitadas
-    df.drop(columns=["Tarifa × Superficie"], inplace=True, errors="ignore")
-    if "Tarifa S/." in df.columns:
-        df.drop(columns=["Tarifa S/."], inplace=True, errors="ignore")
-
-    # Orden de columnas (dejar base al inicio; resto se mantiene)
-    base = ["Fecha", "AÑO", "MES", "SEMANA"]
-    tail = [
-        "Código único","Denominador",
-        "Q versiones por elemento Mes" if "Q versiones por elemento Mes" in df.columns else None,
-        "Código +1 pieza","+1 Superficie",
-        "Tarifa × Superficie (1ra por Código único)",
-        "Semana en Mes por Código","Conteo mensual",
-        "NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
-        "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI",
-        "Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
-        "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo",
-        "SumaTopada_div_ConteoZ","Tarifa Real ($)"
-    ]
-    tail = [c for c in tail if c]
-    cols = [*base] + [c for c in df.columns if c not in (*base, *tail, "_FechaDT", "_YM")] + tail
-    return df[cols].copy()
 
 
-# ───────────────────────── Resúmenes y consolidado ─────────────────────────
-_BRAND_CANDS = ["MARCA", "ANUNCIANTE", "BRAND", "CLIENTE"]
-_DATE_MON = ["DIA"]
-_DATE_OUT = ["Fecha", "FECHA"]
-
-def _brands_count(df: pd.DataFrame, candidates: List[str]) -> int | None:
-    for c in candidates:
-        if c in df.columns:
-            return int(df[c].dropna().astype(str).nunique())
-    return None
-
-def _date_range(df: pd.DataFrame, candidates: List[str]) -> Tuple[str, str] | Tuple[None, None]:
-    for c in candidates:
-        if c in df.columns:
-            s = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
-            if s.notna().any():
-                return (s.min().date().isoformat(), s.max().date().isoformat())
-    return (None, None)
-
-def resumen_mougli(df: pd.DataFrame, es_monitor: bool) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame([{"Filas": 0, "Rango de fechas": "", "Marcas / Anunciantes": 0}])
-    d1, d2 = _date_range(df, _DATE_MON if es_monitor else _DATE_OUT)
-    r = f"{d1} - {d2}" if d1 and d2 else ""
-    b = _brands_count(df, _BRAND_CANDS) or 0
-    return pd.DataFrame([{"Filas": len(df), "Rango de fechas": r, "Marcas / Anunciantes": b}])
-
-
-_TARGET_ORDER = [
-    "FECHA","AÑO","MES","SEMANA","MEDIO","MARCA","PRODUCTO","VERSIÓN",
-    "DURACIÓN","TIPO ELEMENTO","TIME / Q VERSIONES","EMISORA / DISTRITO",
-    "PROGRAMA / AVENIDA","BREAK / CALLE","POS. SPOT / ORIENTACIÓN",
-    "INVERSIÓN REAL","SECTOR","CATEGORÍA","ÍTEM","AGENCIA","ANUNCIANTE",
-    "REGIÓN","ANCHO / LATITUD","ALTO / LONGITUD","GEN / +1 SUPERFICIE",
-    "Q ELEMENTOS","EDITORA / PROVEEDOR"
-]
-
-_MONITOR_MAP = {
-    "DIA":"FECHA","AÑO":"AÑO","MES":"MES","SEMANA":"SEMANA",
-    "MEDIO":"MEDIO","MARCA":"MARCA","PRODUCTO":"PRODUCTO","VERSION":"VERSIÓN",
-    "DURACION":"DURACIÓN","TIPO":"TIPO ELEMENTO","HORA":"TIME / Q VERSIONES",
-    "EMISORA/SITE":"EMISORA / DISTRITO","PROGRAMA/TIPO DE SITE":"PROGRAMA / AVENIDA",
-    "BREAK":"BREAK / CALLE","POS. SPOT":"POS. SPOT / ORIENTACIÓN",
-    "INVERSION":"INVERSIÓN REAL","SECTOR":"SECTOR","CATEGORIA":"CATEGORÍA",
-    "ITEM":"ÍTEM","AGENCIA":"AGENCIA","ANUNCIANTE":"ANUNCIANTE",
-    "REGION/ÁMBITO":"REGIÓN","ANCHO":"ANCHO / LATITUD","ALTO":"ALTO / LONGITUD",
-    "GENERO":"GEN / +1 SUPERFICIE","SPOTS":"Q ELEMENTOS","EDITORA":"EDITORA / PROVEEDOR"
-}
-_OUT_MAP = {
-    "Fecha":"FECHA","AÑO":"AÑO","MES":"MES","SEMANA":"SEMANA","Medio":"MEDIO",
-    "Marca":"MARCA","Producto":"PRODUCTO","Versión":"VERSIÓN","Duración (Seg)":"DURACIÓN",
-    "Tipo Elemento":"TIPO ELEMENTO","Q versiones por elemento Mes":"TIME / Q VERSIONES",
-    "Distrito":"EMISORA / DISTRITO","Avenida":"PROGRAMA / AVENIDA",
-    "Nro Calle/Cuadra":"BREAK / CALLE","Orientación de Vía":"POS. SPOT / ORIENTACIÓN",
-    "Tarifa Real ($)":"INVERSIÓN REAL","Sector":"SECTOR",
-    "Categoría":"CATEGORÍA","Item":"ÍTEM","Agencia":"AGENCIA","Anunciante":"ANUNCIANTE",
-    "Región":"REGIÓN","Latitud":"ANCHO / LATITUD","Longitud":"ALTO / LONGITUD",
-    "+1 Superficie":"GEN / +1 SUPERFICIE","Conteo mensual":"Q ELEMENTOS",
-    "Proveedor":"EDITORA / PROVEEDOR"
-}
-
-def _to_unified(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=_TARGET_ORDER)
-    df = df.copy()
-    df.rename(columns={k: v for k, v in mapping.items() if k in df.columns}, inplace=True)
-    for c in _TARGET_ORDER:
-        if c not in df.columns:
-            df[c] = np.nan
-    df = df[_TARGET_ORDER]
-    if "FECHA" in df.columns:
-        df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
-    return df
-
-
-# ───────────────────────── Escritura Excel (tablas+ocultas) ──────────────────
-def _header_rows_for(df: pd.DataFrame, *, fecha_col: str | None, marca_col: str | None,
-                     extras: List[Tuple[str, str]] | None = None) -> List[Tuple[str, str]]:
-    filas = [("Filas", len(df))]
-    if fecha_col and fecha_col in df.columns and not df.empty:
-        fmin, fmax = df[fecha_col].min(), df[fecha_col].max()
-        val = (f"{pd.to_datetime(fmin, errors='coerce'):%d/%m/%Y} - "
-               f"{pd.to_datetime(fmax, errors='coerce'):%d/%m/%Y}") if pd.notna(fmin) else "—"
-        filas.append(("Rango de fechas", val))
-    if marca_col and marca_col in df.columns:
-        filas.append(("Marcas / Anunciantes", df[marca_col].dropna().nunique()))
-    if extras:
-        for col, tit in extras:
-            if col in df.columns:
-                vals = ", ".join(sorted(map(str, df[col].dropna().astype(str).unique())))
-                filas.append((tit, vals if vals else "—"))
-    return filas
-
-
-def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
-                                       sheet_name: str,
-                                       df: pd.DataFrame,
-                                       header_rows: List[Tuple[str, str]],
-                                       hide_cols: List[str] | None = None):
-    header_df = pd.DataFrame(header_rows, columns=["Descripción", "Valor"])
-    header_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
-    ws = writer.sheets[sheet_name]
-
-    # Altura fija por defecto para toda la hoja (no auto-ajustar)
-    ws.set_default_row(15)            # altura aprox. por defecto de Excel (~15 pts)
-    ws.set_row(0, 15)                 # Fila de encabezado del bloque
-    ws.set_row(1, 15)                 # Segunda fila del bloque (coherencia)
-
-    # Escribir datos como tabla
-    start_row = len(header_df) + 2
-    df = df.copy()
-    df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
-
-    nrow, ncol = df.shape
-    start_col_letter = "A"
-    end_col_letter = _col_letter(ncol - 1)
-    rng = f"{start_col_letter}{start_row+1}:{end_col_letter}{start_row + max(nrow,1) + 1}"
-
-    ws.add_table(rng, {
-        "name": f"{sheet_name.replace(' ', '_')}_tbl",
-        "header_row": True,
-        "style": "Table Style Medium 9",
-        "columns": [{"header": str(h)} for h in df.columns]
-    })
-    ws.freeze_panes(start_row + 1, 0)
-    ws.set_column(0, max(0, ncol - 1), 18)
-
-    # Ocultar columnas técnicas si aplica
-    if hide_cols:
-        col_idx = {c: i for i, c in enumerate(df.columns)}
-        for cname in hide_cols:
-            if cname in col_idx:
-                i = col_idx[cname]
-                ws.set_column(i, i, None, None, {"hidden": True})
-
-
-# ───────────────────────── Función principal ─────────────────────────
-def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] | None,
-                             outview_factor: float | None = None):
+# ============ Construcción del mapa ============
+def build_map(
+    data_dir: Path,
+    nivel: str,  # 'regiones' | 'provincias' | 'distritos' (nivel a dibujar finalmente)
+    colores: dict | None,
+    style: dict | None,
+    seleccion: Iterable[str] | None,  # nombres del name_key correspondiente al nivel
+) -> Tuple[str, List[str], dict, str]:
     """
-    Devuelve (df_result, xlsx_bytes) con hojas condicionales:
-      - 'Monitor' solo si hay Monitor
-      - 'OutView' solo si hay OutView
-      - 'Consolidado' solo si hay ambas fuentes
-      - (ya no se genera 'Resumen')
-    Filas con altura fija por defecto.
+    Devuelve: (html, seleccion_normalizada, geojson, name_field)
     """
-    factores = factores or load_monitor_factors()
-    outview_factor = float(outview_factor if outview_factor is not None else load_outview_factor())
+    colores = colores or {}
+    style = style or {}
+    col_fill = colores.get("fill", "#713030")
+    col_selected = colores.get("selected", "#5F48C6")
+    col_border = colores.get("border", "#000000")
+    weight = float(style.get("weight", 0.8))
+    show_borders = bool(style.get("show_borders", True))
+    show_basemap = bool(style.get("show_basemap", True))
 
-    # MONITOR
-    df_m = _read_monitor_txt(monitor_file)
-    df_m = _aplicar_factores_monitor(df_m, factores)
+    gj = _load_geojson(data_dir, nivel)
+    name_key = _name_field_for_level(nivel, gj)
+    sel = set(s.strip() for s in (seleccion or []) if str(s).strip())
 
-    # OUTVIEW (enriquecido)
-    df_o_raw = _read_out_robusto(out_file)
-    df_o = _transform_outview_enriquecido(df_o_raw, factor_outview=outview_factor) if not df_o_raw.empty else pd.DataFrame()
+    m = folium.Map(location=[-9.2, -75.0], zoom_start=5, tiles=None)
+    if show_basemap:
+        folium.TileLayer("openstreetmap", name="OSM").add_to(m)
 
-    # CONSOLIDADO unificado SOLO si existen ambas fuentes
-    if not df_m.empty and not df_o.empty:
-        mon_u = _to_unified(df_m, _MONITOR_MAP)
-        out_u = _to_unified(df_o, _OUT_MAP)
-        df_c = pd.concat([mon_u, out_u], ignore_index=True)
-        df_c.sort_values(["FECHA", "MARCA"], inplace=True, na_position="last")
+    def style_fn(feat):
+        name = str(feat["properties"].get(name_key, "")).strip()
+        is_sel = name in sel if sel else False
+        return {
+            "color": col_border if show_borders else (col_selected if is_sel else col_fill),
+            "weight": weight if show_borders else 0.0,
+            "fillColor": col_selected if is_sel else col_fill,
+            "fillOpacity": 0.9 if is_sel else 0.7,
+        }
+
+    tooltip_fields = [k for k in ("NAME_1", "NAME_2", "NAME_3") if k in gj["features"][0]["properties"]]
+    GeoJson(
+        gj,
+        name=nivel.capitalize(),
+        style_function=style_fn,
+        tooltip=folium.GeoJsonTooltip(fields=tooltip_fields) if tooltip_fields else None,
+    ).add_to(m)
+
+    folium.LayerControl().add_to(m)
+    return _folium_to_html(m), sorted(list(sel)), gj, name_key
+
+
+# ============ Exportaciones ============
+def _try_import_matplotlib():
+    try:
+        import matplotlib  # noqa
+        return True
+    except Exception:
+        return False
+
+
+def export_png_from_geojson(
+    gj: dict,
+    *,
+    seleccion: Iterable[str] | None,
+    name_key: str,
+    color_fill: str,
+    color_selected: str,
+    color_border: str,
+    background: str | None,  # None → transparente
+    figsize: Tuple[int, int] = (1600, 1600),
+) -> bytes:
+    if not _try_import_matplotlib():
+        raise RuntimeError("matplotlib no está instalado")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon
+    from matplotlib.collections import PatchCollection
+
+    sel = set(s.strip() for s in (seleccion or []) if str(s).strip())
+    patches_sel: List[Polygon] = []
+    patches_rest: List[Polygon] = []
+
+    def add_poly(coords, is_sel: bool):
+        for ring in coords:
+            xy = [(x, y) for (x, y) in ring]
+            (patches_sel if is_sel else patches_rest).append(Polygon(xy, closed=True))
+
+    for feat in gj["features"]:
+        geom = feat["geometry"]
+        name = str(feat["properties"].get(name_key, "")).strip()
+        is_sel = name in sel
+        if geom["type"] == "Polygon":
+            add_poly(geom["coordinates"], is_sel)
+        elif geom["type"] == "MultiPolygon":
+            for poly in geom["coordinates"]:
+                add_poly(poly, is_sel)
+
+    xs, ys = [], []
+    for feat in gj["features"]:
+        geom = feat["geometry"]
+        if geom["type"] == "Polygon":
+            for ring in geom["coordinates"]:
+                for x, y in ring:
+                    xs.append(x); ys.append(y)
+        elif geom["type"] == "MultiPolygon":
+            for poly in geom["coordinates"]:
+                for ring in poly:
+                    for x, y in ring:
+                        xs.append(x); ys.append(y)
+
+    fig = plt.figure(figsize=(figsize[0]/100, figsize[1]/100), dpi=100)
+    ax = plt.axes()
+    ax.set_aspect("equal", adjustable="box")
+    ax.axis("off")
+
+    if background is None:
+        fig.patch.set_alpha(0.0)
+        ax.patch.set_alpha(0.0)
     else:
-        df_c = pd.DataFrame()
+        fig.patch.set_facecolor(background)
+        ax.set_facecolor(background)
 
-    # Excel
-    xlsx = BytesIO()
-    with pd.ExcelWriter(xlsx, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
-        if not df_m.empty:
-            hdr_m = _header_rows_for(
-                df_m, fecha_col="DIA", marca_col="MARCA",
-                extras=[("SECTOR","Sectores"), ("CATEGORIA","Categorías"), ("REGION/ÁMBITO","Regiones")]
-            )
-            _write_sheet_with_header_and_table(w, sheet_name="Monitor", df=df_m, header_rows=hdr_m)
+    if patches_rest:
+        pc_rest = PatchCollection(patches_rest, facecolor=color_fill, edgecolor=color_border, linewidths=0.6, alpha=0.85)
+        ax.add_collection(pc_rest)
+    if patches_sel:
+        pc_sel = PatchCollection(patches_sel, facecolor=color_selected, edgecolor=color_border, linewidths=0.8, alpha=0.95)
+        ax.add_collection(pc_sel)
 
-        if not df_o.empty:
-            hdr_o = _header_rows_for(
-                df_o, fecha_col="Fecha", marca_col="Anunciante",
-                extras=[("Tipo Elemento","Tipo"), ("Proveedor","Proveedor"), ("Región","Regiones")]
-            )
-            ocultas_out = [
-                "Código único","Denominador","Código +1 pieza",
-                "Tarifa × Superficie","Semana en Mes por Código",
-                "NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
-                "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI",
-                "Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
-                "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ"
-            ]
-            _write_sheet_with_header_and_table(
-                w, sheet_name="OutView", df=df_o, header_rows=hdr_o, hide_cols=ocultas_out
-            )
+    if xs and ys:
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+        dx = (xmax - xmin) * 0.05
+        dy = (ymax - ymin) * 0.05
+        ax.set_xlim(xmin - dx, xmax + dx)
+        ax.set_ylim(ymin - dy, ymax + dy)
 
-        if not df_c.empty:  # solo si hay ambas
-            d1, d2 = _date_range(df_c, ["FECHA"])
-            fuentes = "Monitor + OutView"
-            hdr_c = [("Filas", len(df_c)), ("Rango de fechas", f"{d1} - {d2}" if d1 and d2 else ""), ("Fuentes incluidas", fuentes)]
-            _write_sheet_with_header_and_table(w, sheet_name="Consolidado", df=df_c, header_rows=hdr_c)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.1, transparent=(background is None))
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
 
-        # Ajuste visual global: sin 'text_wrap', solo alineación vertical
-        wb = w.book
-        fmt = wb.add_format({"valign": "vcenter"})
-        for sh in ("Monitor", "OutView", "Consolidado"):
-            if sh in w.sheets:
-                ws = w.sheets[sh]
-                ws.set_column(0, 0, 22, fmt)
-                ws.set_column(1, 60, 18, fmt)
 
-    xlsx.seek(0)
-    # Resultado principal
-    if not df_c.empty:
-        df_result = df_c
-    elif not df_m.empty:
-        df_result = df_m
-    else:
-        df_result = df_o
-    return df_result, xlsx
+def export_csv_names(names: Iterable[str], header: str = "nombre") -> bytes:
+    import pandas as pd
+    df = pd.DataFrame({header: list(names)})
+    return df.to_csv(index=False).encode("utf-8")
