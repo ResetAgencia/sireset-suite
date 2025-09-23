@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import io
 import json
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Tuple, Optional
 
 import folium
 from folium import GeoJson
@@ -24,7 +24,7 @@ def _load_geojson(data_dir: Path, nivel: str) -> dict:
            distritos  → gadm41_PER_3.json
       4) lo mismo pero relativo a core/data
     """
-    candidates = []
+    candidates: List[Path] = []
     candidates.append(data_dir / "peru" / f"{nivel}.json")
     candidates.append(data_dir / f"{nivel}.json")
 
@@ -50,23 +50,33 @@ def _load_geojson(data_dir: Path, nivel: str) -> dict:
     raise FileNotFoundError(f"No se encontró GeoJSON para '{nivel}'. Probé: {tried}")
 
 # ────────────────────────── helpers de propiedades ──────────────────────
-def _name_field(gj: dict) -> str:
-    # toma el primer campo disponible entre NAME_1/2/3/0
+def _name_field_for_level(nivel: str, gj: dict | None = None) -> str:
+    """
+    Regresa el campo de nombre recomendado por nivel.
+    Si viene un GeoJSON, intenta confirmar que exista y si no busca el primero con strings.
+    """
+    preferred = {"regiones": "NAME_1", "provincias": "NAME_2", "distritos": "NAME_3"}
+    if gj is None:
+        return preferred.get(nivel, "NAME_1")
     props0 = gj["features"][0]["properties"]
-    for k in ("NAME_1", "NAME_2", "NAME_3", "NAME_0"):
+    key = preferred.get(nivel)
+    if key and key in props0:
+        return key
+    # fallback: primero NAME_3/2/1/0 que exista
+    for k in ("NAME_3", "NAME_2", "NAME_1", "NAME_0"):
         if k in props0:
             return k
-    # fallback: primer string que parezca nombre
+    # último recurso: primer string
     for k, v in props0.items():
         if isinstance(v, str):
             return k
     return list(props0.keys())[0]
 
-def available_names(gj: dict) -> List[str]:
-    key = _name_field(gj)
-    vals = [f["properties"].get(key, "") for f in gj["features"]]
-    # filtra vacíos y ordena
-    return sorted({str(v) for v in vals if str(v).strip()})
+def available_names(gj: dict, name_key: Optional[str] = None) -> List[str]:
+    if name_key is None:
+        name_key = _name_field_for_level("regiones", gj)  # default
+    vals = [f["properties"].get(name_key, "") for f in gj["features"]]
+    return sorted({str(v).strip() for v in vals if str(v).strip()})
 
 # ────────────────────────── construcción del mapa ───────────────────────
 def build_map(
@@ -80,7 +90,7 @@ def build_map(
     Devuelve: (html, seleccion_normalizada, geojson, name_field)
     - colores: {"fill": "#713030", "selected": "#5F48C6", "border": "#000000"}
     - style:   {"weight": 0.8, "show_borders": True, "show_basemap": True}
-    - seleccion: lista de nombres a resaltar (según campo nombre).
+    - seleccion: lista de nombres a resaltar (según name_field).
     """
     colores = colores or {}
     style = style or {}
@@ -92,9 +102,10 @@ def build_map(
     show_basemap = bool(style.get("show_basemap", True))
 
     gj = _load_geojson(data_dir, nivel)
-    name_key = _name_field(gj)
+    name_key = _name_field_for_level(nivel, gj)
 
     sel = set(s.strip() for s in (seleccion or []) if str(s).strip())
+
     # Centro aproximado del Perú
     m = folium.Map(location=[-9.2, -75.0], zoom_start=5, tiles=None)
     if show_basemap:
@@ -123,6 +134,13 @@ def build_map(
     return html, sorted(list(sel)), gj, name_key
 
 # ────────────────────────── exportaciones ────────────────────────────────
+def _try_import_matplotlib():
+    try:
+        import matplotlib  # noqa
+        return True
+    except Exception:
+        return False
+
 def export_png_from_geojson(
     gj: dict,
     *,
@@ -136,8 +154,11 @@ def export_png_from_geojson(
 ) -> bytes:
     """
     Exporta un PNG simple (sin tiles OSM) dibujando los polígonos del GeoJSON.
-    No requiere geopandas/cartopy. Usa matplotlib.
+    No requiere geopandas/cartopy. Usa matplotlib si está disponible.
     """
+    if not _try_import_matplotlib():
+        raise RuntimeError("matplotlib no está instalado")
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -149,7 +170,6 @@ def export_png_from_geojson(
     patches_rest: List[Polygon] = []
 
     def add_poly(coords, is_sel: bool):
-        # coords: [[(lon,lat),...], ...]  (posibles multipolígonos)
         for ring in coords:
             xy = [(x, y) for (x, y) in ring]
             (patches_sel if is_sel else patches_rest).append(Polygon(xy, closed=True))
@@ -164,7 +184,6 @@ def export_png_from_geojson(
             for poly in geom["coordinates"]:
                 add_poly(poly, is_sel)
 
-    # Extensión aproximada del Perú para que salga bien centrado
     xs, ys = [], []
     for feat in gj["features"]:
         geom = feat["geometry"]
@@ -190,7 +209,6 @@ def export_png_from_geojson(
         pc_sel = PatchCollection(patches_sel, facecolor=color_selected, edgecolor=color_border, linewidths=0.8, alpha=0.95)
         ax.add_collection(pc_sel)
 
-    # márgenes
     if xs and ys:
         xmin, xmax = min(xs), max(xs)
         ymin, ymax = min(ys), max(ys)
@@ -214,6 +232,5 @@ def export_png_from_geojson(
 
 def export_csv_names(names: Iterable[str]) -> bytes:
     import pandas as pd
-    df = pd.DataFrame({"region": list(names)})
+    df = pd.DataFrame({"nombre": list(names)})
     return df.to_csv(index=False).encode("utf-8")
-
