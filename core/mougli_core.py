@@ -432,7 +432,12 @@ def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
     header_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
     ws = writer.sheets[sheet_name]
 
-    # Escribir datos
+    # Altura fija por defecto para toda la hoja (no auto-ajustar)
+    ws.set_default_row(15)            # altura aprox. por defecto de Excel (~15 pts)
+    ws.set_row(0, 15)                 # Fila de encabezado del bloque
+    ws.set_row(1, 15)                 # Segunda fila del bloque (coherencia)
+
+    # Escribir datos como tabla
     start_row = len(header_df) + 2
     df = df.copy()
     df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
@@ -464,9 +469,12 @@ def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
 def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] | None,
                              outview_factor: float | None = None):
     """
-    Devuelve (df_result, xlsx_bytes):
-    - Hojas: Monitor, OutView (enriquecido), Consolidado, Resumen
-    - Tablas con formato, encabezados enriquecidos, columnas técnicas ocultas en OutView
+    Devuelve (df_result, xlsx_bytes) con hojas condicionales:
+      - 'Monitor' solo si hay Monitor
+      - 'OutView' solo si hay OutView
+      - 'Consolidado' solo si hay ambas fuentes
+      - (ya no se genera 'Resumen')
+    Filas con altura fija por defecto.
     """
     factores = factores or load_monitor_factors()
     outview_factor = float(outview_factor if outview_factor is not None else load_outview_factor())
@@ -479,17 +487,14 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     df_o_raw = _read_out_robusto(out_file)
     df_o = _transform_outview_enriquecido(df_o_raw, factor_outview=outview_factor) if not df_o_raw.empty else pd.DataFrame()
 
-    # CONSOLIDADO unificado
-    mon_u = _to_unified(df_m, _MONITOR_MAP) if not df_m.empty else pd.DataFrame(columns=_TARGET_ORDER)
-    out_u = _to_unified(df_o, _OUT_MAP) if not df_o.empty else pd.DataFrame(columns=_TARGET_ORDER)
-    df_c = pd.concat([mon_u, out_u], ignore_index=True)
-    if not df_c.empty:
+    # CONSOLIDADO unificado SOLO si existen ambas fuentes
+    if not df_m.empty and not df_o.empty:
+        mon_u = _to_unified(df_m, _MONITOR_MAP)
+        out_u = _to_unified(df_o, _OUT_MAP)
+        df_c = pd.concat([mon_u, out_u], ignore_index=True)
         df_c.sort_values(["FECHA", "MARCA"], inplace=True, na_position="last")
-
-    # RESUMEN doble
-    rm = resumen_mougli(df_m, es_monitor=True);  rm.insert(0, "Fuente", "Monitor")
-    ro = resumen_mougli(df_o, es_monitor=False); ro.insert(0, "Fuente", "OutView")
-    resumen = pd.concat([rm, ro], ignore_index=True)
+    else:
+        df_c = pd.DataFrame()
 
     # Excel
     xlsx = BytesIO()
@@ -518,19 +523,16 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                 w, sheet_name="OutView", df=df_o, header_rows=hdr_o, hide_cols=ocultas_out
             )
 
-        if not df_c.empty:
+        if not df_c.empty:  # solo si hay ambas
             d1, d2 = _date_range(df_c, ["FECHA"])
-            fuentes = ("Monitor" if not df_m.empty else "") + (" + " if (not df_m.empty and not df_o.empty) else "") + ("OutView" if not df_o.empty else "")
+            fuentes = "Monitor + OutView"
             hdr_c = [("Filas", len(df_c)), ("Rango de fechas", f"{d1} - {d2}" if d1 and d2 else ""), ("Fuentes incluidas", fuentes)]
             _write_sheet_with_header_and_table(w, sheet_name="Consolidado", df=df_c, header_rows=hdr_c)
 
-        if not resumen.empty:
-            _write_sheet_with_header_and_table(w, sheet_name="Resumen", df=resumen, header_rows=[("Notas","Resumen por fuente")])
-
-        # Ajuste visual global
+        # Ajuste visual global: sin 'text_wrap', solo alineación vertical
         wb = w.book
-        fmt = wb.add_format({"text_wrap": True, "valign": "vcenter"})
-        for sh in ("Monitor", "OutView", "Consolidado", "Resumen"):
+        fmt = wb.add_format({"valign": "vcenter"})
+        for sh in ("Monitor", "OutView", "Consolidado"):
             if sh in w.sheets:
                 ws = w.sheets[sh]
                 ws.set_column(0, 0, 22, fmt)
@@ -545,4 +547,3 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     else:
         df_result = df_o
     return df_result, xlsx
-
