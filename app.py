@@ -1,194 +1,112 @@
-# app.py
-# SiReset Suite – Menú, Mougli y Mapito (estable)
 import io
 import json
-import pathlib
-from typing import Optional, Dict
-
-import pandas as pd
 import streamlit as st
+from pathlib import Path
 
-from core.mougli_core import procesar_monitor_outview
+# --- Módulos de negocio
+from core.mougli_core import procesar_monitor_outview, resumen_mougli
 from core.mapito_core import build_map
 
-APP_TITLE = "SiReset"
+# ---------- Config ----------
+st.set_page_config(page_title="SiReset", layout="wide")
+DATA_DIR = Path("data")  # carpeta base para geojson y auxiliares (Mapito)
 
-# ----- CONFIG GENERAL -----
-st.set_page_config(page_title=APP_TITLE, page_icon="🟪", layout="wide")
+# ---------- Encabezado ----------
+st.image("assets/Encabezado.png", use_container_width=True)
 
-ASSETS_DIR = pathlib.Path(__file__).parent / "assets"
-DATA_DIR = pathlib.Path(__file__).parent / "data"
-DATA_DIR.mkdir(exist_ok=True, parents=True)
+# ---------- Sidebar: selector de aplicación ----------
+app = st.sidebar.radio("Elige aplicación", ["Mougli", "Mapito"], index=0)
 
-# ----- ENCABEZADO -----
-col_l, col_c, col_r = st.columns([1, 6, 1])
-with col_c:
-    # Muestra tu imagen de encabezado si existe, si no, solo escribe el título
-    header_img = ASSETS_DIR / "Encabezado.png"
-    if header_img.exists():
-        st.image(str(header_img), use_container_width=True)
-    else:
-        st.title("SiReset")
+# =============== M O U G L I ===============
+if app == "Mougli":
+    st.markdown("## Mougli – Monitor & OutView")
 
-# ----- SIDEBAR: MENÚ + ESTADO GLOBAL -----
-st.sidebar.markdown("### Elige aplicación")
-app = st.sidebar.radio("",
-                       ["Mougli", "Mapito"],
-                       label_visibility="collapsed",
-                       key="app_choice")
+    colL, colR = st.columns(2)
 
-# Factores por defecto (también usados si la función se llama sin factores)
-DEFAULT_FACTORES = {
-    "tv": 0.26,
-    "cable": 0.42,
-    "radio": 0.42,
-    "revista": 0.15,
-    "diarios": 0.15,
-}
-
-def _sidebar_factores() -> Dict[str, float]:
-    st.sidebar.markdown("### Factores (Monitor)")
-    tv = st.sidebar.number_input("TV", min_value=0.0, max_value=2.0, value=DEFAULT_FACTORES["tv"], step=0.01)
-    cable = st.sidebar.number_input("CABLE", min_value=0.0, max_value=2.0, value=DEFAULT_FACTORES["cable"], step=0.01)
-    radio = st.sidebar.number_input("RADIO", min_value=0.0, max_value=2.0, value=DEFAULT_FACTORES["radio"], step=0.01)
-    revista = st.sidebar.number_input("REVISTA", min_value=0.0, max_value=2.0, value=DEFAULT_FACTORES["revista"], step=0.01)
-    diarios = st.sidebar.number_input("DIARIOS", min_value=0.0, max_value=2.0, value=DEFAULT_FACTORES["diarios"], step=0.01)
-    return {"tv": tv, "cable": cable, "radio": radio, "revista": revista, "diarios": diarios}
-
-# Guardamos factores en session_state (así están disponibles para cualquier llamada)
-if "factores" not in st.session_state:
-    st.session_state["factores"] = DEFAULT_FACTORES.copy()
-st.session_state["factores"] = _sidebar_factores()
-
-# ----- APP: MOUGLI -----
-def ui_mougli():
-    st.header("Mougli – Monitor & OutView")
-
-    col1, col2 = st.columns(2)
-    with col1:
+    with colL:
         st.caption("Sube Monitor (.txt)")
-        up_m = st.file_uploader("",
-                                type=["txt"],
-                                label_visibility="collapsed",
-                                key="up_monitor")
-    with col2:
+        up_monitor = st.file_uploader(
+            "Drag and drop file here", type=["txt"], key="m_txt", label_visibility="collapsed"
+        )
+    with colR:
         st.caption("Sube OutView (.csv / .xlsx)")
-        up_o = st.file_uploader("",
-                                type=["csv", "xlsx"],
-                                label_visibility="collapsed",
-                                key="up_outview")
+        up_out = st.file_uploader(
+            "Drag and drop file here", type=["csv", "xlsx"], key="o_csv", label_visibility="collapsed"
+        )
 
-    run = st.button("Procesar Mougli", type="primary")
-    if run:
-        if not up_m:
-            st.error("Sube el archivo **Monitor (.txt)**.")
-            return
+    # --------- Factores SOLO en Mougli ----------
+    st.sidebar.markdown("### Factores (Monitor)")
+    f_tv = st.sidebar.number_input("TV", min_value=0.0, step=0.01, value=0.26)
+    f_cable = st.sidebar.number_input("CABLE", min_value=0.0, step=0.01, value=0.42)
+    f_radio = st.sidebar.number_input("RADIO", min_value=0.0, step=0.01, value=0.42)
+    f_revista = st.sidebar.number_input("REVISTA", min_value=0.0, step=0.01, value=0.15)
+    f_diarios = st.sidebar.number_input("DIARIOS", min_value=0.0, step=0.01, value=0.15)
 
-        # Leemos OutView si existe
-        out_df: Optional[pd.DataFrame] = None
-        if up_o is not None:
-            if up_o.name.lower().endswith(".csv"):
-                out_df = pd.read_csv(up_o)
-            else:
-                out_df = pd.read_excel(up_o)
+    factores = {
+        "TV": f_tv,
+        "CABLE": f_cable,
+        "RADIO": f_radio,
+        "REVISTA": f_revista,
+        "DIARIOS": f_diarios,
+    }
 
-        # Llamada SIEMPRE con factores (y la función también tolera None)
-        factores = st.session_state.get("factores", DEFAULT_FACTORES)
-
+    st.write("")
+    if st.button("Procesar Mougli", type="primary", use_container_width=False):
         try:
-            result = procesar_monitor_outview(monitor_file=up_m, outview_df=out_df, factores=factores)
+            df, xlsx = procesar_monitor_outview(
+                up_monitor, up_out, factores=factores
+            )
+            st.success("¡Listo! ✅")
+
+            # Descarga Excel (si se generó)
+            if xlsx is not None:
+                st.download_button(
+                    "Descargar Excel",
+                    data=xlsx.getvalue(),
+                    file_name="mougli_resultado.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            # Resumen bonito
+            st.markdown("### Resumen")
+            st.dataframe(resumen_mougli(df), use_container_width=True)
+
         except Exception as e:
             st.error(f"Ocurrió un error procesando: {e}")
-            return
 
-        # Mostramos un ok + descarga si existe
-        st.success("¡Listo! ✅")
-        # Resumen simple
-        if "resumen" in result:
-            st.subheader("Resumen")
-            st.json(result["resumen"], expanded=False)
+# =============== M A P I T O ===============
+else:
+    st.markdown("## Mapito – Perú")
 
-        # Descarga Excel si corresponde
-        if "excel_bytes" in result and result["excel_bytes"]:
-            st.download_button(
-                "Descargar Excel",
-                data=result["excel_bytes"],
-                file_name="mougli_resultado.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-# ----- APP: MAPITO -----
-def ui_mapito():
-    st.header("Mapito – Perú")
-    # Estilos (color y grosor)
+    # Controles de estilo SOLO Mapito
     st.sidebar.markdown("### Estilos del mapa")
-    color_general = st.sidebar.color_picker("Color general", "#BEBEBE", key="map_gen_color")
-    color_sel = st.sidebar.color_picker("Color seleccionado", "#5F48C6", key="map_sel_color")
-    color_borde = st.sidebar.color_picker("Color de borde", "#000000", key="map_border_color")
-    grosor = st.sidebar.slider("Grosor de borde", 0.2, 4.0, 0.8, 0.05, key="map_border_width")
-    mostrar_bordes = st.sidebar.checkbox("Mostrar bordes", value=True)
+    color_general = st.sidebar.color_picker("Color general", "#713030")
+    color_sel = st.sidebar.color_picker("Color seleccionado", "#5F48C6")
+    color_borde = st.sidebar.color_picker("Color de borde", "#000000")
+    grosor = st.sidebar.slider("Grosor de borde", 0.1, 2.0, 0.8, 0.05)
 
-    tabs = st.tabs(["Regiones", "Provincias", "Distritos", "Lima/Callao"])
+    show_borders = st.sidebar.checkbox("Mostrar bordes", value=True)
+    show_basemap = st.sidebar.checkbox("Mostrar mapa base (OSM) en vista interactiva", value=True)
 
-    # Región
-    with tabs[0]:
-        st.caption("Elige una o más regiones (opcional)")
-        html, _ = build_map(
+    # Construye el mapa (usa GeoJSON locales dentro de data/peru)
+    try:
+        html, seleccion = build_map(
             data_dir=DATA_DIR,
             nivel="regiones",
-            color_general=color_general,
-            color_selected=color_sel,
-            color_border=color_borde,
-            border_weight=grosor,
-            show_borders=mostrar_bordes,
-            filtros=None,
+            colores={
+                "fill": color_general,
+                "selected": color_sel,
+                "border": color_borde,
+            },
+            style={
+                "weight": grosor,
+                "show_borders": show_borders,
+                "show_basemap": show_basemap,
+            },
         )
-        st.components.v1.html(html, height=650, scrolling=True)
+        st.components.v1.html(html, height=700, scrolling=False)
+        if seleccion:
+            st.caption(f"Elementos mostrados: {len(seleccion)}")
 
-    # Provincias
-    with tabs[1]:
-        html, _ = build_map(
-            data_dir=DATA_DIR,
-            nivel="provincias",
-            color_general=color_general,
-            color_selected=color_sel,
-            color_border=color_borde,
-            border_weight=grosor,
-            show_borders=mostrar_bordes,
-            filtros=None,
-        )
-        st.components.v1.html(html, height=650, scrolling=True)
-
-    # Distritos
-    with tabs[2]:
-        html, _ = build_map(
-            data_dir=DATA_DIR,
-            nivel="distritos",
-            color_general=color_general,
-            color_selected=color_sel,
-            color_border=color_borde,
-            border_weight=grosor,
-            show_borders=mostrar_bordes,
-            filtros=None,
-        )
-        st.components.v1.html(html, height=650, scrolling=True)
-
-    # Lima/Callao
-    with tabs[3]:
-        html, _ = build_map(
-            data_dir=DATA_DIR,
-            nivel="lima_callao",
-            color_general=color_general,
-            color_selected=color_sel,
-            color_border=color_borde,
-            border_weight=grosor,
-            show_borders=mostrar_bordes,
-            filtros=None,
-        )
-        st.components.v1.html(html, height=650, scrolling=True)
-
-# ----- ROUTER -----
-if app == "Mougli":
-    ui_mougli()
-else:
-    ui_mapito()
+    except Exception as e:
+        st.error(f"No se pudo construir el mapa: {e}")
