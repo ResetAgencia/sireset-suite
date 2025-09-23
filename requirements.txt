@@ -1,0 +1,12 @@
+﻿streamlit
+pandas
+numpy
+folium
+branca
+jinja2
+pillow
+pyarrow
+openpyxl
+xlsxwriter
+gitpython
+watchdog
