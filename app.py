@@ -197,60 +197,61 @@ if app == "Mougli":
 
     colL, colR = st.columns(2)
     with colL:
-        st.caption("Sube Monitor (.txt)")
-        up_monitor = st.file_uploader(
-            "Drag and drop file here", type=["txt"], key="m_txt", label_visibility="collapsed"
+        st.caption("Sube Monitor (.txt) — puedes subir varios")
+        up_monitor_multi = st.file_uploader(
+            "Arrastra y suelta aquí", type=["txt"], key="m_txt_multi",
+            label_visibility="collapsed", accept_multiple_files=True
         )
     with colR:
-        st.caption("Sube OutView (.csv / .xlsx)")
-        up_out = st.file_uploader(
-            "Drag and drop file here", type=["csv", "xlsx"], key="o_csv", label_visibility="collapsed"
+        st.caption("Sube OutView (.csv / .xlsx) — puedes subir varios")
+        up_out_multi = st.file_uploader(
+            "Arrastra y suelta aquí", type=["csv", "xlsx"], key="o_multi",
+            label_visibility="collapsed", accept_multiple_files=True
         )
 
     st.write("")
     if st.button("Procesar Mougli", type="primary"):
         try:
-            # Clonar archivos para no perder el puntero
-            mon_proc, mon_sum = _clone_for_processing_and_summary(up_monitor)
-            out_proc, out_sum = _clone_for_processing_and_summary(up_out)
+            # Combinar entradas (se mantienen 100% compatibles con mougli_core)
+            mon_proc, df_m_res = combinar_monitor_txt(up_monitor_multi or [])
+            out_proc, df_o_res = combinar_outview(up_out_multi or [])
 
-            # Procesamiento principal (firma tolerante)
+            # Procesamiento principal (usa tu core tal cual)
             df_result, xlsx = llamar_procesar_monitor_outview(
                 mon_proc, out_proc, factores=factores, outview_factor=out_factor
             )
 
             st.success("¡Listo! ✅")
 
-            # Resúmenes enriquecidos (en pantalla)
+            # Resúmenes enriquecidos (pantalla)
             colA, colB = st.columns(2)
             with colA:
                 st.markdown("#### Monitor")
-                df_m = None
-                if mon_sum is not None:
+                if df_m_res is None and mon_proc is not None:
+                    # Si no pudimos armar df_m_res, lo leo del combinado
                     try:
-                        mon_sum.seek(0)
-                        df_m = _read_monitor_txt(mon_sum)
+                        mon_proc.seek(0)
+                        df_m_res = _read_monitor_txt(mon_proc)
                     except Exception:
-                        df_m = None
-                st.dataframe(_web_resumen_enriquecido(df_m, es_monitor=True), use_container_width=True)
+                        df_m_res = None
+                st.dataframe(_web_resumen_enriquecido(df_m_res, es_monitor=True), use_container_width=True)
 
             with colB:
                 st.markdown("#### OutView")
-                df_o = None
-                if out_sum is not None:
+                if df_o_res is None and out_proc is not None:
                     try:
-                        out_sum.seek(0)
-                        df_o = _read_out_robusto(out_sum)
+                        out_proc.seek(0)
+                        df_o_res = _read_out_robusto(out_proc)
                     except Exception:
-                        df_o = None
-                st.dataframe(_web_resumen_enriquecido(df_o, es_monitor=False), use_container_width=True)
+                        df_o_res = None
+                st.dataframe(_web_resumen_enriquecido(df_o_res, es_monitor=False), use_container_width=True)
 
             # Alertas
             issues = []
-            issues += _scan_alertas(df_m, es_monitor=True)
-            issues += _scan_alertas(df_o, es_monitor=False)
+            issues += _scan_alertas(df_m_res, es_monitor=True)
+            issues += _scan_alertas(df_o_res, es_monitor=False)
             if issues:
-                st.warning("⚠️ *Revisión sugerida antes de exportar*:\n\n- " + "\n- ".join(issues))
+                st.warning("⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues))
 
             # Descarga Excel
             st.download_button(
@@ -266,6 +267,7 @@ if app == "Mougli":
 
         except Exception as e:
             st.error(f"Ocurrió un error procesando: {e}")
+
 
 # =============== M A P I T O ===============
 elif app == "Mapito" and build_map is not None:
