@@ -1,57 +1,82 @@
-import streamlit as st
-from pathlib import Path
-import pandas as pd
-from io import BytesIO
+# app.py
 import sys
+from pathlib import Path
+from io import BytesIO
+import inspect
 
-# ------------------------------------------------------------
-# Asegurar que Python vea el proyecto y la carpeta 'core'
+import streamlit as st
+import pandas as pd
+
+# --- asegurar import de 'core'
 APP_ROOT = Path(__file__).parent.resolve()
 for p in (APP_ROOT, APP_ROOT / "core"):
     sp = str(p)
     if sp not in sys.path:
         sys.path.insert(0, sp)
-# ------------------------------------------------------------
 
-# --- Importar módulo completo y resolver símbolos de forma segura
+# --- Importar mougli_core (módulo completo) y resolver símbolos
 try:
-    import core.mougli_core as mc  # modulo completo
+    import core.mougli_core as mc
 except Exception as e:
     st.error(
-        "No pude importar `core.mougli_core`. "
-        "Verifica que exista la carpeta **core/** en el mismo nivel que `app.py`, "
-        "que dentro esté el archivo **mougli_core.py** y (si es posible) añade un `__init__.py` vacío en `core/`.\n\n"
+        "No pude importar `core.mougli_core`. Verifica que exista la carpeta **core/** al lado de `app.py` "
+        "y que dentro esté `mougli_core.py`.\n\n"
         f"Detalle técnico: {e}"
     )
     st.stop()
 
-def require(symbol_name):
-    """Obtiene un símbolo del módulo mc o muestra error claro."""
-    fn = getattr(mc, symbol_name, None)
-    if fn is None:
-        st.error(
-            f"No encontré la función **{symbol_name}** en `core/mougli_core.py`.\n\n"
-            "Asegúrate de que la versión desplegada de *mougli_core.py* contiene esa función.\n"
-            "Si estás usando una versión antigua, revisa el nombre o expórtala con ese nombre."
-        )
-        st.stop()
-    return fn
+def require_any(preferido: str, *alternativos: str):
+    """Devuelve la primera función disponible entre preferido y alias."""
+    candidatos = (preferido, *alternativos)
+    for name in candidatos:
+        fn = getattr(mc, name, None)
+        if callable(fn):
+            if name != preferido:
+                st.info(f"Usando `{name}()` como alias de `{preferido}()`.")
+            return fn
+    exports = sorted([x for x in dir(mc) if not x.startswith("_")])
+    st.error(
+        f"No encontré la función **{preferido}** en `core/mougli_core.py`.\n\n"
+        f"Alias probados: {', '.join(alternativos) or '—'}\n\n"
+        f"Funciones visibles en el módulo: {', '.join(exports) or '—'}"
+    )
+    st.stop()
 
-# Resolver funciones que usa la app
-procesar_monitor_outview = require("procesar_monitor_outview")
-resumen_mougli = require("resumen_mougli")
-_read_monitor_txt = require("_read_monitor_txt")
-_read_out_robusto = require("_read_out_robusto")
-load_monitor_factors = require("load_monitor_factors")
-save_monitor_factors = require("save_monitor_factors")
-load_outview_factor = require("load_outview_factor")
-save_outview_factor = require("save_outview_factor")
+# Resolver funciones/exportaciones de mougli_core
+procesar_monitor_outview = require_any(
+    "procesar_monitor_outview",
+    "procesar_monitor_outview_v2",
+    "procesar_outview_monitor",
+)
+resumen_mougli      = require_any("resumen_mougli")
+_read_monitor_txt   = require_any("_read_monitor_txt")
+_read_out_robusto   = require_any("_read_out_robusto")
+load_monitor_factors = require_any("load_monitor_factors")
+save_monitor_factors = require_any("save_monitor_factors")
+load_outview_factor  = require_any("load_outview_factor")
+save_outview_factor  = require_any("save_outview_factor")
+
+def llamar_procesar_monitor_outview(monitor_file, out_file, factores, outview_factor):
+    """Llama a procesar_monitor_outview tolerando firmas distintas."""
+    try:
+        sig = inspect.signature(procesar_monitor_outview).parameters
+        if "outview_factor" in sig:
+            return procesar_monitor_outview(
+                monitor_file, out_file, factores=factores, outview_factor=outview_factor
+            )
+        else:
+            return procesar_monitor_outview(monitor_file, out_file, factores=factores)
+    except TypeError:
+        try:
+            return procesar_monitor_outview(monitor_file, out_file, factores, outview_factor)
+        except TypeError:
+            return procesar_monitor_outview(monitor_file, out_file, factores)
 
 # Mapito (opcional)
 try:
     from core.mapito_core import build_map
 except Exception:
-    build_map = None  # si no está, ocultamos la opción
+    build_map = None
 
 # ---------- Config ----------
 st.set_page_config(page_title="SiReset", layout="wide")
@@ -60,7 +85,7 @@ DATA_DIR = Path("data")
 # ---------- Encabezado ----------
 st.image("assets/Encabezado.png", use_container_width=True)
 
-# ---------- Sidebar: selector & ajustes ----------
+# ---------- Sidebar ----------
 apps = ["Mougli"]
 if build_map is not None:
     apps.append("Mapito")
@@ -144,7 +169,7 @@ def _scan_alertas(df, *, es_monitor: bool):
         malos = sorted(set([t for t in tipos.unique() if t in BAD_TIPOS]))
         if malos:
             alerts.append("Se detectaron valores en TIPO ELEMENTO: " + ", ".join(malos))
-    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if "Región" in (df.columns if df is not None else []) else None)
+    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if (df is not None and "Región" in df.columns) else None)
     if reg_col and reg_col in df.columns:
         regiones = df[reg_col].astype(str).str.upper().str.strip().replace({"NAN": ""}).dropna()
         fuera = sorted(set([r for r in regiones.unique() if r and r != "LIMA"]))
@@ -153,6 +178,7 @@ def _scan_alertas(df, *, es_monitor: bool):
     return alerts
 
 def _clone_for_processing_and_summary(upfile):
+    """Duplica el UploadedFile en dos BytesIO (para procesar y para resumen)."""
     if upfile is None:
         return None, None
     data = upfile.getvalue()
@@ -184,19 +210,18 @@ if app == "Mougli":
     st.write("")
     if st.button("Procesar Mougli", type="primary"):
         try:
+            # Clonar archivos para no perder el puntero
             mon_proc, mon_sum = _clone_for_processing_and_summary(up_monitor)
             out_proc, out_sum = _clone_for_processing_and_summary(up_out)
 
-            df_result, xlsx = procesar_monitor_outview(
-                mon_proc, out_proc, factores={"TV": st.session_state.get('TV', 0.26) if False else None} or None,
-                outview_factor=st.session_state.get('OUTV', None) if False else None
+            # Procesamiento principal (firma tolerante)
+            df_result, xlsx = llamar_procesar_monitor_outview(
+                mon_proc, out_proc, factores=factores, outview_factor=out_factor
             )
-            # Nota: arriba paso factores/outview_factor dummy solo para mantener firma;
-            # realmente usaremos los valores del sidebar que ya guardamos abajo:
-            df_result, xlsx = procesar_monitor_outview(mon_proc, out_proc, factores={'TV': f_tv,'CABLE': f_cable,'RADIO': f_radio,'REVISTA': f_revista,'DIARIOS': f_diarios}, outview_factor=out_factor)
 
             st.success("¡Listo! ✅")
 
+            # Resúmenes enriquecidos (en pantalla)
             colA, colB = st.columns(2)
             with colA:
                 st.markdown("#### Monitor")
@@ -220,12 +245,14 @@ if app == "Mougli":
                         df_o = None
                 st.dataframe(_web_resumen_enriquecido(df_o, es_monitor=False), use_container_width=True)
 
+            # Alertas
             issues = []
             issues += _scan_alertas(df_m, es_monitor=True)
             issues += _scan_alertas(df_o, es_monitor=False)
             if issues:
                 st.warning("⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues))
 
+            # Descarga Excel
             st.download_button(
                 "Descargar Excel",
                 data=xlsx.getvalue(),
@@ -233,6 +260,7 @@ if app == "Mougli":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
+            # Vista previa
             st.markdown("### Vista previa")
             st.dataframe(df_result.head(100), use_container_width=True)
 
