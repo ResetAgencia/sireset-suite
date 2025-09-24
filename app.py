@@ -1,28 +1,23 @@
-# app.py
+# app.py — cabecera segura
 
 import streamlit as st
 
-# --- Compatibilidad: si alguien llama experimental_rerun, usa st.rerun() ---
+# --- Compatibilidad: experimental_rerun -> rerun ---
 if not hasattr(st, "experimental_rerun"):
-    def _compat_experimental_rerun():
+    def experimental_rerun():
         st.rerun()
-    st.experimental_rerun = _compat_experimental_rerun
+    st.experimental_rerun = experimental_rerun  # type: ignore
 
 import sys
 from pathlib import Path
 from io import BytesIO
 import inspect
 from typing import Tuple, Optional, List
-
-import streamlit as st
 import pandas as pd
 
-# ---------------- Autenticación ----------------
-# auth.py debe exponer: login_ui(), current_user(), logout_button()
-from auth import (
-    login_ui, current_user, logout_button,
-    list_users, create_user, update_user, set_password, list_all_modules
-)
+# ---- auth imports en una sola línea (evita errores de paréntesis) ----
+from auth import login_ui, current_user, logout_button, list_users, create_user, update_user, set_password, list_all_modules
+
 
 # ---------- Config general ----------
 st.set_page_config(page_title="SiReset", layout="wide")
