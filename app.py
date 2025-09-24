@@ -16,8 +16,14 @@ from typing import Tuple, Optional, List
 import pandas as pd
 
 # ---- auth imports en una sola línea (evita errores de paréntesis) ----
-from auth import login_ui, current_user, logout_button, list_users, create_user, update_user, set_password, list_all_modules
-
+try:
+    from auth import (
+        login_ui, current_user, logout_button,
+        list_users, create_user, update_user, set_password, list_all_modules,
+    )
+except Exception as e:
+    st.error(f"No pude importar el módulo de autenticación (auth.py): {e}")
+    st.stop()
 
 # ---------- Config general ----------
 st.set_page_config(page_title="SiReset", layout="wide")
@@ -60,7 +66,7 @@ def require_any(preferido: str, *alternativos: str):
     st.stop()
 
 
-# Resolver funciones/exportaciones de mougli_core
+# Resolver funciones/exportaciones de mougli_core (sin tocar Mougli)
 procesar_monitor_outview = require_any(
     "procesar_monitor_outview",
     "procesar_monitor_outview_v2",
@@ -247,8 +253,8 @@ with st.sidebar:
     logout_button()
 
 # ------------------- Apps permitidas por usuario -------------------
-mods = [m.lower() for m in (user.get("modules") or [])]
-allowed = []
+mods = [str(m).lower() for m in (user.get("modules") or [])]
+allowed: List[str] = []
 if "mougli" in mods:
     allowed.append("Mougli")
 if "mapito" in mods:
