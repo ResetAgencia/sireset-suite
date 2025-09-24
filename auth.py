@@ -1,6 +1,5 @@
 # auth.py — Autenticación + usuarios + registro de módulos + tokens persistentes
-
-from __future__ import annotations  # <-- Debe ir primero (arregla SyntaxError)
+from __future__ import annotations  # <-- Debe ir primero
 
 import os
 import sqlite3
@@ -9,6 +8,7 @@ import base64
 import hashlib
 import hmac
 import time
+import shutil
 from typing import Optional, Tuple, Dict, Any, List
 
 import streamlit as st
@@ -32,20 +32,71 @@ def _safe_rerun():
             pass
 
 
-# =========================== Configuración DB ===========================
+# =========================== Resolución de ruta de BD =========================
+def _get_secret_or_env(key: str) -> Optional[str]:
+    # 1) st.secrets, 2) os.environ, 3) None
+    try:
+        if key in st.secrets:
+            val = st.secrets[key]
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    except Exception:
+        pass
+    val = os.environ.get(key, "").strip()
+    return val or None
 
-DB_PATH = os.environ.get(
-    "SIRESET_DB_PATH",
-    os.path.join(os.path.dirname(__file__), "sireset.db"),
-)
+def _default_persistent_db_path() -> str:
+    # ~/.sireset/sireset.db (persistente por usuario)
+    home = os.path.expanduser("~")
+    base = os.path.join(home, ".sireset")
+    return os.path.join(base, "sireset.db")
 
+def _legacy_db_path_near_code() -> str:
+    # Ruta anterior: junto al archivo auth.py
+    return os.path.join(os.path.dirname(__file__), "sireset.db")
+
+def _resolve_db_path() -> str:
+    # Prioridad:
+    # 1) SIRESET_DB_PATH en secrets o env
+    # 2) ~/.sireset/sireset.db
+    # Si existe BD legada junto al código y NO existe en el destino final, se migra.
+    from_secrets_or_env = _get_secret_or_env("SIRESET_DB_PATH")
+    target = from_secrets_or_env or _default_persistent_db_path()
+    target_dir = os.path.dirname(target)
+    os.makedirs(target_dir, exist_ok=True)
+
+    legacy = _legacy_db_path_near_code()
+    if os.path.isfile(legacy) and not os.path.isfile(target):
+        try:
+            shutil.copy2(legacy, target)
+        except Exception:
+            # Si falla la copia, seguimos usando target (se creará vacío)
+            pass
+    return target
+
+DB_PATH = _resolve_db_path()
+
+def db_path() -> str:
+    """Ruta efectiva de la base de datos (para mostrar en UI si se desea)."""
+    return DB_PATH
+
+
+# =========================== Conexión y PRAGMAs ===============================
 def _connect():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
+    # PRAGMAs razonables para estabilidad de writes concurrentes
+    try:
+        con.execute("PRAGMA foreign_keys = ON;")
+        con.execute("PRAGMA journal_mode = WAL;")
+        con.execute("PRAGMA synchronous = NORMAL;")
+    except Exception:
+        pass
     return con
 
 def init_db():
     """Crea tablas si no existen."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = _connect()
     cur = con.cursor()
 
@@ -121,7 +172,6 @@ def list_all_modules(enabled_only: bool = False) -> List[Dict[str, Any]]:
 
 
 # =========================== Password hashing ===========================
-
 _PBKDF2_ITERS = 240_000
 
 def _hash_pw(password: str) -> str:
@@ -152,7 +202,6 @@ def _verify_pw(password: str, stored: str) -> bool:
 
 
 # =========================== CRUD de usuarios ===========================
-
 def admin_exists() -> bool:
     con = _connect()
     cur = con.cursor()
@@ -200,6 +249,30 @@ def list_users() -> List[Dict[str, Any]]:
 def _default_user_modules() -> List[str]:
     return [m["code"] for m in list_all_modules(enabled_only=True)]
 
+def _backup_users_json():
+    """Guarda un backup JSON de los usuarios por si algo sale mal (no bloquea flujo si falla)."""
+    try:
+        con = _connect()
+        cur = con.cursor()
+        cur.execute("SELECT * FROM users ORDER BY id ASC")
+        rows = cur.fetchall()
+        con.close()
+        data = []
+        for r in rows:
+            data.append({
+                "id": r["id"], "email": r["email"], "name": r["name"],
+                "role": r["role"], "active": int(r["active"]),
+                "modules": json.loads(r["modules"] or "[]")
+            })
+        backup_dir = os.path.join(os.path.dirname(DB_PATH), "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        ts = int(time.time())
+        path = os.path.join(backup_dir, f"users_{ts}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass  # No interrumpir el flujo por fallas de backup
+
 def create_user(email: str, name: str, role: str, pwd: str,
                 active: bool = True, modules: Optional[List[str]] = None) -> int:
     modules = modules if modules is not None else _default_user_modules()
@@ -214,6 +287,7 @@ def create_user(email: str, name: str, role: str, pwd: str,
     con.commit()
     uid = cur.lastrowid
     con.close()
+    _backup_users_json()
     return uid
 
 def update_user(uid: int, *, name: Optional[str] = None, role: Optional[str] = None,
@@ -234,6 +308,7 @@ def update_user(uid: int, *, name: Optional[str] = None, role: Optional[str] = N
     cur.execute(f"UPDATE users SET {', '.join(sets)} WHERE id=?", vals)
     con.commit()
     con.close()
+    _backup_users_json()
 
 def set_password(uid: int, new_pwd: str):
     update_user(uid, pw_hash=_hash_pw(new_pwd))
@@ -254,7 +329,6 @@ def authenticate(email: str, pwd: str) -> Optional[Dict[str, Any]]:
 
 
 # =========================== Tokens persistentes ===========================
-
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -311,7 +385,6 @@ def revoke_all_tokens(user_id: int):
 
 
 # =========================== Helpers de sesión/UI ===========================
-
 def _get_query_params() -> Dict[str, Any]:
     try:
         # Streamlit 1.31+
@@ -345,7 +418,6 @@ def user_has_module(user: Optional[Dict[str, Any]], code: str) -> bool:
 
 
 # =========================== UI pública ===========================
-
 def _bootstrap_if_needed():
     """Crea el admin inicial si la BD está vacía y registra módulos base."""
     init_db()
