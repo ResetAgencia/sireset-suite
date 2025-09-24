@@ -63,7 +63,7 @@ def _decode_bytes(b: bytes) -> str:
             return b.decode(enc)
         except Exception:
             pass
-    raise ValueError("No fue posible decodificar el TXT (probé utf-8-sig, latin-1, cp1252).")
+    raise ValueError("No fue posible decodificar el TXT.")
 
 
 def _col_letter(idx: int) -> str:
@@ -77,10 +77,7 @@ def _col_letter(idx: int) -> str:
 
 # ───────────────────────── Lectores de fuentes ──────────────────────
 def _read_monitor_txt(file) -> pd.DataFrame:
-    """
-    Lee el TXT de Monitor detectando la fila de cabecera con '|MEDIO|'.
-    Normaliza nombres y columnas clave.
-    """
+    """Lee TXT de Monitor detectando cabecera con '|MEDIO|' y normaliza columnas."""
     if file is None:
         return pd.DataFrame()
 
@@ -179,9 +176,7 @@ def _version_column(df: pd.DataFrame) -> str | None:
 
 
 def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -> pd.DataFrame:
-    """
-    Replica los cálculos del “basito” para OutView, incluyendo Tarifa Real ($).
-    """
+    """Replica cálculos de OutView (incluye Tarifa Real $)."""
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -225,7 +220,6 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
 
     # Tarifa × Superficie SOLO primera fila por pieza (para cálculo) con factor
     df["Tarifa × Superficie"] = np.where(first_in_piece, tarifa_num * df["+1 Superficie"], 0.0)
-    # Ajuste por factor y dólar (3.8)
     df["Tarifa × Superficie"] = (df["Tarifa × Superficie"] * float(factor_outview)) / 3.8
 
     df["Semana en Mes por Código"] = (
@@ -319,12 +313,12 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
         df["SumaTopada_div_ConteoZ"] * 0.8
     )
 
-    # Limpiezas solicitadas
+    # Limpiezas solicitadas globales
     df.drop(columns=["Tarifa × Superficie"], inplace=True, errors="ignore")
     if "Tarifa S/." in df.columns:
         df.drop(columns=["Tarifa S/."], inplace=True, errors="ignore")
 
-    # Orden de columnas (dejar base al inicio; resto se mantiene)
+    # Orden de columnas (base al inicio)
     base = ["Fecha", "AÑO", "MES", "SEMANA"]
     tail = [
         "Código único","Denominador",
@@ -481,7 +475,6 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
       - 'Monitor' solo si hay Monitor
       - 'OutView' solo si hay OutView
       - 'Consolidado' solo si hay ambas fuentes
-    Filas con altura fija por defecto; tablas en formato “Table Style Medium 9”.
     """
     factores = factores or load_monitor_factors()
     outview_factor = float(outview_factor if outview_factor is not None else load_outview_factor())
@@ -503,6 +496,24 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     else:
         df_c = pd.DataFrame()
 
+    # ===== OutView: eliminar columnas internas (no deben aparecer en la hoja) =====
+    INTERNAL_OUT_COLS = [
+        # lista del usuario (más variantes robustas)
+        "Código único", "Denominador",
+        "Q versiones por elemento", "Q versiones por elemento Mes", "Q versiones por elemento mes",
+        "Código +1 pieza", "+1 superficie", "+1 Superficie",
+        "Tarifa x superficie", "Tarifa × Superficie",
+        "Tarifa × Superficie (1ra por Código único)",
+        "Semana en mes por código", "Semana en Mes por Código",
+        "Conteo Mensual", "Conteo mensual",
+        "NB_EXTRAE_6_7", "Fecha_AB", "Proveedor_AC", "TipoElemento_AD", "Distrito_AE",
+        "Avenida_AF", "NroCalleCuadra_AG", "OrientacionVia_AH", "Marca_AI",
+        "Conteo_AB_AI", "Conteo_Z_AB_AI", "TarifaS_div3", "TarifaS_div3_sobre_Conteo",
+        "Suma_AM_Z_AB_AI", "TopeTipo_AQ", "Suma_AM_Topada_Tipo", "SumaTopada_div_ConteoZ",
+        "Tarifa Real ($)"
+    ]
+    df_o_public = df_o.drop(columns=INTERNAL_OUT_COLS, errors="ignore")
+
     # Excel
     xlsx = BytesIO()
     with pd.ExcelWriter(xlsx, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
@@ -518,28 +529,14 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                 df_o, fecha_col="Fecha", marca_col="Anunciante",
                 extras=[("Tipo Elemento","Tipo"), ("Proveedor","Proveedor"), ("Región","Regiones")]
             )
-
-            # Columnas internas que NO deben aparecer en OutView (hoja)
-            INTERNAL_OUT_COLS = [
-                "Código único","Denominador","Q versiones por elemento","Q versiones por elemento Mes",
-                "Código +1 pieza","+1 superficie","+1 Superficie",
-                "Tarifa x superficie","Tarifa × Superficie","Tarifa × Superficie (1ra por Código único)",
-                "Semana en mes por código","Semana en Mes por Código","Conteo Mensual","Conteo mensual",
-                "NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
-                "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI",
-                "Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
-                "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ",
-                "Tarifa Real ($)"
-            ]
-
-            # Escribimos una versión pública SIN esas columnas
-            df_o_public = df_o.drop(columns=INTERNAL_OUT_COLS, errors="ignore")
+            # Escribimos la versión "pública" sin columnas internas:
             _write_sheet_with_header_and_table(w, sheet_name="OutView", df=df_o_public, header_rows=hdr_o)
 
         if not df_c.empty:  # solo si hay ambas
             d1, d2 = _date_range(df_c, ["FECHA"])
-            fuentes = "Monitor + OutView"
-            hdr_c = [("Filas", len(df_c)), ("Rango de fechas", f"{d1} - {d2}" if d1 and d2 else ""), ("Fuentes incluidas", fuentes)]
+            hdr_c = [("Filas", len(df_c)),
+                     ("Rango de fechas", f"{d1} - {d2}" if d1 and d2 else ""),
+                     ("Fuentes incluidas", "Monitor + OutView")]
             _write_sheet_with_header_and_table(w, sheet_name="Consolidado", df=df_c, header_rows=hdr_c)
 
         # Ajuste visual global
