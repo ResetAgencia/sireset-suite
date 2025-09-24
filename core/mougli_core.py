@@ -212,14 +212,17 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     # Métricas base
     df["Denominador"] = df.groupby("Código único")["Código único"].transform("size")
     if ver_col:
-        df["Q versiones por elemento Mes"] = df.groupby("Código único")[ver_col].transform("nunique")
+        # Nombre final visible: "Q versiones por elemento" (para mantener compat)
+        df["Q versiones por elemento"] = df.groupby("Código único")[ver_col].transform("nunique")
 
-    df["+1 Superficie"] = df.groupby("Código +1 pieza")["Código +1 pieza"].transform("size")
+    # "+1 superficie" visible (mantener etiqueta como en tu requerimiento)
+    df["+1 superficie"] = df.groupby("Código +1 pieza")["Código +1 pieza"].transform("size")
+
     tarifa_num = pd.to_numeric(df.get("Tarifa S/."), errors="coerce").fillna(0)
     first_in_piece = (df.groupby("Código +1 pieza").cumcount() == 0)
 
-    # Tarifa × Superficie SOLO primera fila por pieza (para cálculo) con factor
-    df["Tarifa × Superficie"] = np.where(first_in_piece, tarifa_num * df["+1 Superficie"], 0.0)
+    # Tarifa × Superficie SOLO primera fila por pieza (para cálculo) con factor (columna interna)
+    df["Tarifa × Superficie"] = np.where(first_in_piece, tarifa_num * df["+1 superficie"], 0.0)
     df["Tarifa × Superficie"] = (df["Tarifa × Superficie"] * float(factor_outview)) / 3.8
 
     df["Semana en Mes por Código"] = (
@@ -228,16 +231,17 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     order_in_month = (
         df.sort_values(["Código único","_YM","_FechaDT"]).groupby(["Código único","_YM"]).cumcount()
     )
-    df["Conteo mensual"] = (order_in_month == 0).astype(int)
+    # "Conteo Mensual" (visible) con mayúscula inicial
+    df["Conteo Mensual"] = (order_in_month == 0).astype(int)
 
-    # Inversión: primera TxS por Código único / nº de piezas del código
+    # Inversión: primera TxS por Código único / nº de piezas del código (interna derivada)
     df_pieces = df[df["Tarifa × Superficie"] != 0].sort_values(["Código único","_FechaDT"])
     per_code_first = df_pieces.groupby("Código único")["Tarifa × Superficie"].first()
     per_code_count = df_pieces.groupby("Código único")["Tarifa × Superficie"].size()
     per_code_value = (per_code_first / per_code_count).astype(float)
     df["Tarifa × Superficie (1ra por Código único)"] = df["Código único"].map(per_code_value)
 
-    # Columnas "Excel" (AB..AI y EXTRAE)
+    # Columnas "Excel" (AB..AI y EXTRAE) — internas
     if "NombreBase" in df.columns:
         s_nb = df["NombreBase"].astype(str)
         df["NB_EXTRAE_6_7"] = s_nb.str.slice(5, 12)
@@ -256,7 +260,7 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     copy_or_empty("Orientación de Vía", "OrientacionVia_AH")
     copy_or_empty("Marca", "Marca_AI")
 
-    # Conteos tipo CONTAR.SI.CONJUNTO
+    # Conteos tipo CONTAR.SI.CONJUNTO — internas
     ab_ai_keys = ["Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
                   "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
     for c in ab_ai_keys:
@@ -273,11 +277,11 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     counts2 = df.groupby(z_keys, dropna=False).size().reset_index(name="Conteo_Z_AB_AI")
     df = df.merge(counts2, on=z_keys, how="left")
 
-    # TarifaS/3 y división por conteo
+    # TarifaS/3 — interna de apoyo
     df["TarifaS_div3"] = tarifa_num / 3.0
     df["TarifaS_div3_sobre_Conteo"] = df["TarifaS_div3"] / df["Conteo_AB_AI"].astype(float)
 
-    # SUMAR.SI.CONJUNTO(AM ; Z==AA ; D..N==AC..AI)
+    # SUMAR.SI.CONJUNTO(AM ; Z==AA ; D..N==AC..AI) — interna
     sum_keys = ["NB_EXTRAE_6_7","Proveedor","Tipo Elemento","Distrito",
                 "Avenida","Nro Calle/Cuadra","Orientación de Vía","Marca"]
     for c in sum_keys:
@@ -289,7 +293,7 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     )
     df = df.merge(sums, on=sum_keys, how="left")
 
-    # Tope por Tipo
+    # Tope por Tipo — internas de apoyo
     tipo_to_base = {
         "BANDEROLA": 12000, "CLIP": 600, "MINIPOLAR": 1000, "PALETA": 600,
         "PANEL": 1825, "PANEL CARRETERO": 5000, "PANTALLA LED": 5400,
@@ -302,18 +306,20 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     an_val = pd.to_numeric(df["Suma_AM_Z_AB_AI"], errors="coerce")
     df["Suma_AM_Topada_Tipo"] = np.where(np.isnan(tope), an_val, np.minimum(an_val, tope))
 
-    # División AO/AK y Tarifa Real ($)
+    # División AO/AK y Tarifa Real ($) — Tarifa Real ($) visible
     denom = pd.to_numeric(df["Conteo_Z_AB_AI"], errors="coerce")
-    df["SumaTopada_div_ConteoZ"] = np.where(denom > 0,
-                                            pd.to_numeric(df["Suma_AM_Topada_Tipo"], errors="coerce") / denom,
-                                            0.0)
+    df["SumaTopada_div_ConteoZ"] = np.where(
+        denom > 0,
+        pd.to_numeric(df["Suma_AM_Topada_Tipo"], errors="coerce") / denom,
+        0.0
+    )
     df["Tarifa Real ($)"] = np.where(
         tipo_up == "PANTALLA LED",
         df["SumaTopada_div_ConteoZ"] * 0.4,
         df["SumaTopada_div_ConteoZ"] * 0.8
     )
 
-    # Limpiezas solicitadas globales
+    # Limpiezas solicitadas globales (internas)
     df.drop(columns=["Tarifa × Superficie"], inplace=True, errors="ignore")
     if "Tarifa S/." in df.columns:
         df.drop(columns=["Tarifa S/."], inplace=True, errors="ignore")
@@ -322,15 +328,23 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     base = ["Fecha", "AÑO", "MES", "SEMANA"]
     tail = [
         "Código único","Denominador",
-        "Q versiones por elemento Mes" if "Q versiones por elemento Mes" in df.columns else None,
-        "Código +1 pieza","+1 Superficie",
+        # visibles: "Q versiones por elemento"
+        "Q versiones por elemento" if "Q versiones por elemento" in df.columns else None,
+        "Código +1 pieza",
+        # visible con minúscula: "+1 superficie"
+        "+1 superficie",
+        # interna derivada:
         "Tarifa × Superficie (1ra por Código único)",
-        "Semana en Mes por Código","Conteo mensual",
+        # visible:
+        "Semana en Mes por Código","Conteo Mensual",
+        # internas:
         "NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
         "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI",
         "Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
         "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo",
-        "SumaTopada_div_ConteoZ","Tarifa Real ($)"
+        "SumaTopada_div_ConteoZ",
+        # visible:
+        "Tarifa Real ($)"
     ]
     tail = [c for c in tail if c]
     cols = [*base] + [c for c in df.columns if c not in (*base, *tail, "_FechaDT", "_YM")] + tail
@@ -390,13 +404,13 @@ _MONITOR_MAP = {
 _OUT_MAP = {
     "Fecha":"FECHA","AÑO":"AÑO","MES":"MES","SEMANA":"SEMANA","Medio":"MEDIO",
     "Marca":"MARCA","Producto":"PRODUCTO","Versión":"VERSIÓN","Duración (Seg)":"DURACIÓN",
-    "Tipo Elemento":"TIPO ELEMENTO","Q versiones por elemento Mes":"TIME / Q VERSIONES",
+    "Tipo Elemento":"TIPO ELEMENTO","Q versiones por elemento":"TIME / Q VERSIONES",
     "Distrito":"EMISORA / DISTRITO","Avenida":"PROGRAMA / AVENIDA",
     "Nro Calle/Cuadra":"BREAK / CALLE","Orientación de Vía":"POS. SPOT / ORIENTACIÓN",
     "Tarifa Real ($)":"INVERSIÓN REAL","Sector":"SECTOR",
     "Categoría":"CATEGORÍA","Item":"ÍTEM","Agencia":"AGENCIA","Anunciante":"ANUNCIANTE",
     "Región":"REGIÓN","Latitud":"ANCHO / LATITUD","Longitud":"ALTO / LONGITUD",
-    "+1 Superficie":"GEN / +1 SUPERFICIE","Conteo mensual":"Q ELEMENTOS",
+    "+1 superficie":"GEN / +1 SUPERFICIE","Conteo Mensual":"Q ELEMENTOS",
     "Proveedor":"EDITORA / PROVEEDOR"
 }
 
@@ -497,20 +511,22 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
         df_c = pd.DataFrame()
 
     # ===== OutView: eliminar columnas internas (no deben aparecer en la hoja) =====
+    # Mantener VISIBLES: "Conteo Mensual", "Q versiones por elemento", "Tarifa Real ($)", "+1 superficie"
     INTERNAL_OUT_COLS = [
-        # lista del usuario (más variantes robustas)
-        "Código único", "Denominador",
-        "Q versiones por elemento", "Q versiones por elemento Mes", "Q versiones por elemento mes",
-        "Código +1 pieza", "+1 superficie", "+1 Superficie",
-        "Tarifa x superficie", "Tarifa × Superficie",
+        # identificadores y auxiliares
+        "Código único", "Código +1 pieza",
+        "Denominador",
+        # variantes que NO debemos tocar (visibles) — por eso NO están aquí:
+        # "Q versiones por elemento", "Conteo Mensual", "+1 superficie", "Tarifa Real ($)"
+        # internas de cálculo y trazas:
+        "Tarifa × Superficie",
         "Tarifa × Superficie (1ra por Código único)",
-        "Semana en mes por código", "Semana en Mes por Código",
-        "Conteo Mensual", "Conteo mensual",
-        "NB_EXTRAE_6_7", "Fecha_AB", "Proveedor_AC", "TipoElemento_AD", "Distrito_AE",
-        "Avenida_AF", "NroCalleCuadra_AG", "OrientacionVia_AH", "Marca_AI",
-        "Conteo_AB_AI", "Conteo_Z_AB_AI", "TarifaS_div3", "TarifaS_div3_sobre_Conteo",
-        "Suma_AM_Z_AB_AI", "TopeTipo_AQ", "Suma_AM_Topada_Tipo", "SumaTopada_div_ConteoZ",
-        "Tarifa Real ($)"
+        "Semana en mes por código",  # variante en minúsculas
+        # NOTA: "Semana en Mes por Código" la dejamos visible para tu análisis; si la quieres ocultar, agrégala aquí.
+        "NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
+        "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI",
+        "Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
+        "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ"
     ]
     df_o_public = df_o.drop(columns=INTERNAL_OUT_COLS, errors="ignore")
 
@@ -549,11 +565,12 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                 ws.set_column(1, 60, 18, fmt)
 
     xlsx.seek(0)
-    # Resultado principal
+    # Resultado principal para vista previa:
     if not df_c.empty:
         df_result = df_c
     elif not df_m.empty:
         df_result = df_m
     else:
-        df_result = df_o
+        # Si solo hay OutView, muestra versión pública (sin internas) en la vista previa
+        df_result = df_o_public
     return df_result, xlsx
