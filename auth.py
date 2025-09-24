@@ -1,4 +1,13 @@
 # auth.py — Autenticación + usuarios + registro de módulos + tokens persistentes
+
+import streamlit as st
+
+# --- Compatibilidad: si alguien llama experimental_rerun, usa st.rerun() ---
+if not hasattr(st, "experimental_rerun"):
+    def _compat_experimental_rerun():
+        st.rerun()
+    st.experimental_rerun = _compat_experimental_rerun
+
 from __future__ import annotations
 
 import os
