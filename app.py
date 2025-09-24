@@ -1,7 +1,7 @@
 # app.py — SiReset (Streamlit)
 # ✅ Listo para copiar y reemplazar
 # - Mantiene Mougli “intacto” (la lógica vive en core/mougli_core.py)
-# - Vista previa y Excel ocultan columnas internas no deseadas (ver HIDE_OUT_PREVIEW)
+# - Vista previa y Excel ocultan columnas internas no deseadas
 # - Panel Admin muestra la ruta efectiva de la base de datos (auth.db_path)
 
 import streamlit as st
@@ -110,16 +110,32 @@ BAD_TIPOS = {
 }
 
 # Columnas internas que NO deben verse en PREVIEW (pero el Excel ya las oculta desde mougli_core)
+# Nota: la limpieza en preview es *case-insensitive* y tolera espacios.
 HIDE_OUT_PREVIEW = {
-    # claves internas
-    "Código único", "Denominador", "Código +1 pieza",
-    "Tarifa × Superficie",  # por si aparece en brutos
+    "Código único",
+    "Denominador",
+    "Código +1 pieza",
+    "Tarifa × Superficie",
     "Semana en Mes por Código",
-    "NB_EXTRAE_6_7", "Fecha_AB", "Proveedor_AC", "TipoElemento_AD", "Distrito_AE",
-    "Avenida_AF", "NroCalleCuadra_AG", "OrientacionVia_AH", "Marca_AI",
-    "Conteo_AB_AI", "Conteo_Z_AB_AI", "TarifaS_div3", "TarifaS_div3_sobre_Conteo",
-    "Suma_AM_Z_AB_AI", "TopeTipo_AQ", "Suma_AM_Topada_Tipo", "SumaTopada_div_ConteoZ",
-    # ⚠️ NO ocultar: "+1 Superficie", "Conteo mensual", "Tarifa Real ($)", "Q versiones por elemento Mes"
+    "NB_EXTRAE_6_7",
+    "Fecha_AB",
+    "Proveedor_AC",
+    "TipoElemento_AD",
+    "Distrito_AE",
+    "Avenida_AF",
+    "NroCalleCuadra_AG",
+    "OrientacionVia_AH",
+    "Marca_AI",
+    "Conteo_AB_AI",
+    "Conteo_Z_AB_AI",
+    "TarifaS_div3",
+    "TarifaS_div3_sobre_Conteo",
+    "Suma_AM_Z_AB_AI",
+    "TopeTipo_AQ",
+    "Suma_AM_Topada_Tipo",
+    "SumaTopada_div_ConteoZ",
+    # ⚠️ NO ocultar: "+1 Superficie", "Conteo mensual", "Tarifa Real ($)",
+    # "Q versiones por elemento Mes"
 }
 
 def _unique_list_str(series, max_items=50):
@@ -261,10 +277,14 @@ def _preview_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Limpia columnas internas SOLO para la vista previa (no toca el Excel)."""
     if df is None or df.empty:
         return pd.DataFrame()
-    cols = list(df.columns)
-    drop_cols = [c for c in cols if c in HIDE_OUT_PREVIEW]
-    if drop_cols:
-        return df.drop(columns=drop_cols, errors="ignore").copy()
+    # limpieza robusta: normaliza a minúsculas y quita espacios
+    normalized_hide = {c.strip().lower() for c in HIDE_OUT_PREVIEW}
+    cols_to_drop = []
+    for c in df.columns:
+        if c and c.strip().lower() in normalized_hide:
+            cols_to_drop.append(c)
+    if cols_to_drop:
+        return df.drop(columns=cols_to_drop, errors="ignore").copy()
     return df.copy()
 
 
@@ -503,4 +523,5 @@ elif app == "Admin" and is_admin:
                         st.error(f"No se pudo actualizar: {e}")
             else:
                 st.info("Selecciona un usuario del listado para editar.")
+
 
