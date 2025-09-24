@@ -443,8 +443,7 @@ def _header_rows_for(df: pd.DataFrame, *, fecha_col: str | None, marca_col: str 
 def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
                                        sheet_name: str,
                                        df: pd.DataFrame,
-                                       header_rows: List[Tuple[str, str]],
-                                       hide_cols: List[str] | None = None):
+                                       header_rows: List[Tuple[str, str]]):
     header_df = pd.DataFrame(header_rows, columns=["Descripción", "Valor"])
     header_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
     ws = writer.sheets[sheet_name]
@@ -472,14 +471,6 @@ def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
     })
     ws.freeze_panes(start_row + 1, 0)
     ws.set_column(0, max(0, ncol - 1), 18)
-
-    if hide_cols:
-        # Ocultar si el nombre coincide EXACTO con la cabecera
-        col_idx = {c: i for i, c in enumerate(df.columns)}
-        for cname in hide_cols:
-            if cname in col_idx:
-                i = col_idx[cname]
-                ws.set_column(i, i, None, None, {"hidden": True})
 
 
 # ───────────────────────── Función principal ─────────────────────────
@@ -527,9 +518,9 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                 df_o, fecha_col="Fecha", marca_col="Anunciante",
                 extras=[("Tipo Elemento","Tipo"), ("Proveedor","Proveedor"), ("Región","Regiones")]
             )
-            # --- NUEVO: ocultar TODAS las columnas internas solicitadas ---
-            ocultas_out = [
-                # Exactamente como las listaste:
+
+            # Columnas internas que NO deben aparecer en OutView (hoja)
+            INTERNAL_OUT_COLS = [
                 "Código único","Denominador","Q versiones por elemento","Q versiones por elemento Mes",
                 "Código +1 pieza","+1 superficie","+1 Superficie",
                 "Tarifa x superficie","Tarifa × Superficie","Tarifa × Superficie (1ra por Código único)",
@@ -540,9 +531,10 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                 "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ",
                 "Tarifa Real ($)"
             ]
-            _write_sheet_with_header_and_table(
-                w, sheet_name="OutView", df=df_o, header_rows=hdr_o, hide_cols=ocultas_out
-            )
+
+            # Escribimos una versión pública SIN esas columnas
+            df_o_public = df_o.drop(columns=INTERNAL_OUT_COLS, errors="ignore")
+            _write_sheet_with_header_and_table(w, sheet_name="OutView", df=df_o_public, header_rows=hdr_o)
 
         if not df_c.empty:  # solo si hay ambas
             d1, d2 = _date_range(df_c, ["FECHA"])
