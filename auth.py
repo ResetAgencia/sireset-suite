@@ -1,14 +1,6 @@
 # auth.py — Autenticación + usuarios + registro de módulos + tokens persistentes
 
-import streamlit as st
-
-# --- Compatibilidad: si alguien llama experimental_rerun, usa st.rerun() ---
-if not hasattr(st, "experimental_rerun"):
-    def _compat_experimental_rerun():
-        st.rerun()
-    st.experimental_rerun = _compat_experimental_rerun
-
-from __future__ import annotations
+from __future__ import annotations  # <-- Debe ir primero (arregla SyntaxError)
 
 import os
 import sqlite3
@@ -20,6 +12,12 @@ import time
 from typing import Optional, Tuple, Dict, Any, List
 
 import streamlit as st
+
+# --- Compatibilidad: si alguien llama experimental_rerun, usa st.rerun() ---
+if not hasattr(st, "experimental_rerun"):
+    def _compat_experimental_rerun():
+        st.rerun()
+    st.experimental_rerun = _compat_experimental_rerun
 
 
 # =========================== Util: rerun compatible ===========================
@@ -427,4 +425,3 @@ def logout_button(label: str = "Cerrar sesión"):
         _set_user(None)
         _set_query_params()   # limpia parámetros (como tk)
         _safe_rerun()
-
