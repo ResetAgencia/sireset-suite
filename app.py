@@ -15,7 +15,7 @@ import inspect
 from typing import Tuple, Optional, List
 import pandas as pd
 
-# ---- auth imports en una sola línea (evita errores de paréntesis) ----
+# ---- auth imports en una sola línea (defensivo) ----
 try:
     from auth import (
         login_ui, current_user, logout_button,
