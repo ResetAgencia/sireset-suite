@@ -1,4 +1,8 @@
-# app.py — cabecera segura
+# app.py — SiReset (Streamlit)
+# ✅ Listo para copiar y reemplazar
+# - Mantiene Mougli “intacto” (la lógica vive en core/mougli_core.py)
+# - Vista previa y Excel ocultan columnas internas no deseadas (ver HIDE_OUT_PREVIEW)
+# - Panel Admin muestra la ruta efectiva de la base de datos (auth.db_path)
 
 import streamlit as st
 
@@ -12,14 +16,15 @@ import sys
 from pathlib import Path
 from io import BytesIO
 import inspect
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
 import pandas as pd
 
-# ---- auth imports en una sola línea (defensivo) ----
+# ---- auth imports en una sola línea (mensajes claros si falla) ----
 try:
     from auth import (
         login_ui, current_user, logout_button,
         list_users, create_user, update_user, set_password, list_all_modules,
+        db_path as _db_path,  # para mostrar ruta de BD en Admin
     )
 except Exception as e:
     st.error(f"No pude importar el módulo de autenticación (auth.py): {e}")
@@ -102,6 +107,19 @@ def llamar_procesar_monitor_outview(monitor_file, out_file, factores, outview_fa
 BAD_TIPOS = {
     "INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
     "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"
+}
+
+# Columnas internas que NO deben verse en PREVIEW (pero el Excel ya las oculta desde mougli_core)
+HIDE_OUT_PREVIEW = {
+    # claves internas
+    "Código único", "Denominador", "Código +1 pieza",
+    "Tarifa × Superficie",  # por si aparece en brutos
+    "Semana en Mes por Código",
+    "NB_EXTRAE_6_7", "Fecha_AB", "Proveedor_AC", "TipoElemento_AD", "Distrito_AE",
+    "Avenida_AF", "NroCalleCuadra_AG", "OrientacionVia_AH", "Marca_AI",
+    "Conteo_AB_AI", "Conteo_Z_AB_AI", "TarifaS_div3", "TarifaS_div3_sobre_Conteo",
+    "Suma_AM_Z_AB_AI", "TopeTipo_AQ", "Suma_AM_Topada_Tipo", "SumaTopada_div_ConteoZ",
+    # ⚠️ NO ocultar: "+1 Superficie", "Conteo mensual", "Tarifa Real ($)", "Q versiones por elemento Mes"
 }
 
 def _unique_list_str(series, max_items=50):
@@ -239,6 +257,16 @@ def combinar_outview(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
         pass
     return out, dfc
 
+def _preview_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Limpia columnas internas SOLO para la vista previa (no toca el Excel)."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    cols = list(df.columns)
+    drop_cols = [c for c in cols if c in HIDE_OUT_PREVIEW]
+    if drop_cols:
+        return df.drop(columns=drop_cols, errors="ignore").copy()
+    return df.copy()
+
 
 # ------------------- LOGIN (obligatorio) -------------------
 user = current_user()
@@ -344,7 +372,7 @@ if app == "Mougli":
                         df_o_res = None
                 st.dataframe(_web_resumen_enriquecido(df_o_res, es_monitor=False), use_container_width=True)
 
-            issues = []
+            issues: List[str] = []
             issues += _scan_alertas(df_m_res, es_monitor=True)
             issues += _scan_alertas(df_o_res, es_monitor=False)
             if issues:
@@ -358,7 +386,8 @@ if app == "Mougli":
             )
 
             st.markdown("### Vista previa")
-            st.dataframe(df_result.head(100), use_container_width=True)
+            prev = _preview_df(df_result)
+            st.dataframe(prev.head(100), use_container_width=True)
 
         except Exception as e:
             st.error(f"Ocurrió un error procesando: {e}")
@@ -399,6 +428,13 @@ elif app == "Mapito":
 # =============== A D M I N ===============
 elif app == "Admin" and is_admin:
     st.header("Administración de usuarios")
+
+    # Mostrar ruta efectiva de la BD (para evitar “BDs distintas”)
+    try:
+        st.caption(f"📦 Base de datos: `{_db_path()}`")
+    except Exception:
+        pass
+
     all_mods = [m["code"] for m in list_all_modules(enabled_only=False)]
     users = list_users()
 
