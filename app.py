@@ -467,3 +467,4 @@ elif app == "Admin" and is_admin:
                         st.error(f"No se pudo actualizar: {e}")
             else:
                 st.info("Selecciona un usuario del listado para editar.")
+
