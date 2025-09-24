@@ -474,6 +474,7 @@ def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
     ws.set_column(0, max(0, ncol - 1), 18)
 
     if hide_cols:
+        # Ocultar si el nombre coincide EXACTO con la cabecera
         col_idx = {c: i for i, c in enumerate(df.columns)}
         for cname in hide_cols:
             if cname in col_idx:
@@ -526,13 +527,18 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                 df_o, fecha_col="Fecha", marca_col="Anunciante",
                 extras=[("Tipo Elemento","Tipo"), ("Proveedor","Proveedor"), ("Región","Regiones")]
             )
+            # --- NUEVO: ocultar TODAS las columnas internas solicitadas ---
             ocultas_out = [
-                "Código único","Denominador","Código +1 pieza",
-                "Tarifa × Superficie","Semana en Mes por Código",
+                # Exactamente como las listaste:
+                "Código único","Denominador","Q versiones por elemento","Q versiones por elemento Mes",
+                "Código +1 pieza","+1 superficie","+1 Superficie",
+                "Tarifa x superficie","Tarifa × Superficie","Tarifa × Superficie (1ra por Código único)",
+                "Semana en mes por código","Semana en Mes por Código","Conteo Mensual","Conteo mensual",
                 "NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
                 "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI",
                 "Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
-                "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ"
+                "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ",
+                "Tarifa Real ($)"
             ]
             _write_sheet_with_header_and_table(
                 w, sheet_name="OutView", df=df_o, header_rows=hdr_o, hide_cols=ocultas_out
