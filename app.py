@@ -1,5 +1,5 @@
 # app.py — SiReset (Streamlit)
-# ✅ “A prueba de balas”: memoria constante, vista previa ligera, modo seguro para archivos enormes.
+# ✅ “A prueba de balas”: preview ligera; escritura Excel por trozos; errores visibles.
 
 import gc
 from io import BytesIO
@@ -9,6 +9,9 @@ from typing import Tuple, Optional, List
 
 import pandas as pd
 import streamlit as st
+
+# Mostrar detalles de error en la UI
+st.set_option('client.showErrorDetails', True)
 
 # --- Compatibilidad: experimental_rerun -> rerun ---
 if not hasattr(st, "experimental_rerun"):
@@ -21,7 +24,7 @@ try:
     from auth import (
         login_ui, current_user, logout_button,
         list_users, create_user, update_user, set_password, list_all_modules,
-        DB_PATH as AUTH_DB_PATH,   # mostrar ruta real de la BD
+        DB_PATH as AUTH_DB_PATH,
     )
 except Exception as e:
     st.error(f"No pude importar el módulo de autenticación (auth.py): {e}")
@@ -54,7 +57,6 @@ except Exception as e:
 
 
 def require_any(preferido: str, *alternativos: str):
-    """Devuelve la primera función disponible entre preferido y alias."""
     candidatos = (preferido, *alternativos)
     for name in candidatos:
         fn = getattr(mc, name, None)
@@ -81,11 +83,10 @@ save_monitor_factors = require_any("save_monitor_factors")
 load_outview_factor = require_any("load_outview_factor")
 save_outview_factor = require_any("save_outview_factor")
 
-# --------- Helpers y constantes “a prueba de balas” ---------
+# --------- Helpers y constantes ---------
 BAD_TIPOS = {"INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
              "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"}
 
-# Columnas internas que NO deben verse en PREVIEW (Excel ya viene limpio desde core)
 HIDE_OUT_PREVIEW = {
     "Código único","Denominador","Código +1 pieza","Tarifa × Superficie",
     "Semana en Mes por Código","NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD",
@@ -94,10 +95,9 @@ HIDE_OUT_PREVIEW = {
     "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ",
 }
 
-# Límites de seguridad
-HEAVY_BYTES = 180 * 1024 * 1024   # ~180 MB totales subidos
-HEAVY_ROWS_PREVIEW = 300_000      # si supera, no hacemos vista previa
-MAX_PREVIEW_ROWS = 1_000          # filas mostradas en preview ligera
+HEAVY_BYTES = 180 * 1024 * 1024
+HEAVY_ROWS_PREVIEW = 300_000
+MAX_PREVIEW_ROWS = 1_000
 
 
 def _unique_list_str(series, max_items=50):
@@ -121,7 +121,6 @@ def _web_resumen_enriquecido(df: Optional[pd.DataFrame], *, es_monitor: bool) ->
         base = pd.DataFrame([{"Filas": 0, "Rango de fechas": "—", "Marcas / Anunciantes": 0}])
     base_vertical = pd.DataFrame({"Descripción": base.columns, "Valor": base.iloc[0].tolist()})
 
-    # columnas extra
     cat_col = "CATEGORIA" if es_monitor else ("Categoría" if (df is not None and "Categoría" in df.columns) else None)
     reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if (df is not None and "Región" in df.columns) else None)
     tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
@@ -230,7 +229,6 @@ def combinar_outview(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
 
 
 def _preview_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Limpia columnas internas SOLO para la vista previa (no toca el Excel)."""
     if df is None or df.empty:
         return pd.DataFrame()
     normalized_hide = {c.strip().lower() for c in HIDE_OUT_PREVIEW}
@@ -269,7 +267,6 @@ if "mougli" in mods:
     allowed.append("Mougli")
 if "mapito" in mods:
     allowed.append("Mapito")
-# Admin
 is_admin = (user.get("role") == "admin")
 if is_admin:
     allowed.append("Admin")
@@ -319,7 +316,6 @@ if app == "Mougli":
             label_visibility="collapsed", accept_multiple_files=True
         )
 
-    # Detección de modo seguro por tamaño subido
     total_bytes = _size_of_uploads(up_monitor_multi) + _size_of_uploads(up_out_multi)
     heavy_upload = total_bytes > HEAVY_BYTES
     if heavy_upload:
@@ -332,7 +328,7 @@ if app == "Mougli":
                 mon_proc, df_m_res = combinar_monitor_txt(up_monitor_multi or [])
                 out_proc, df_o_res = combinar_outview(up_out_multi or [])
 
-                df_result, xlsx = procesar_monitor_outview(
+                df_result, xlsx = mc.procesar_monitor_outview(
                     mon_proc, out_proc, factores=factores, outview_factor=out_factor
                 )
 
@@ -361,14 +357,12 @@ if app == "Mougli":
                         df_o_res = None
                 st.dataframe(_web_resumen_enriquecido(df_o_res, es_monitor=False), use_container_width=True)
 
-            # Alertas
             issues: List[str] = []
             issues += _scan_alertas(df_m_res, es_monitor=True)
             issues += _scan_alertas(df_o_res, es_monitor=False)
             if issues:
                 st.warning("⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues))
 
-            # Descargas: XLSX (seguro) y CSV rápido (del resultado principal)
             c1, c2 = st.columns(2)
             with c1:
                 st.download_button(
@@ -379,7 +373,7 @@ if app == "Mougli":
                 )
             with c2:
                 try:
-                    csv_data = df_result.to_csv(index=False).encode("utf-8")
+                    csv_data = (df_result or pd.DataFrame()).to_csv(index=False).encode("utf-8")
                 except Exception:
                     csv_data = b""
                 st.download_button(
@@ -389,22 +383,21 @@ if app == "Mougli":
                     mime="text/csv",
                 )
 
-            # Vista previa ligera
             st.markdown("### Vista previa")
             rows = len(df_result) if df_result is not None else 0
             if heavy_upload or rows > HEAVY_ROWS_PREVIEW:
                 st.info(f"Vista previa limitada por tamaño (filas totales: {rows:,}). Se muestran las primeras {MAX_PREVIEW_ROWS:,} filas.")
                 prev = _preview_df(df_result).head(MAX_PREVIEW_ROWS)
-                st.dataframe(prev, use_container_width=True)
             else:
                 prev = _preview_df(df_result).head(MAX_PREVIEW_ROWS)
-                st.dataframe(prev, use_container_width=True)
+            st.dataframe(prev, use_container_width=True)
 
             del prev, df_result, df_m_res, df_o_res
             gc.collect()
 
         except Exception as e:
             st.error(f"Ocurrió un error procesando: {e}")
+            st.exception(e)
             gc.collect()
 
 # =============== M A P I T O ===============
@@ -439,6 +432,7 @@ elif app == "Mapito":
                 st.caption(f"Elementos mostrados: {len(seleccion)}")
         except Exception as e:
             st.error(f"No se pudo construir el mapa: {e}")
+            st.exception(e)
 
 # =============== A D M I N ===============
 elif app == "Admin" and is_admin:
@@ -451,7 +445,6 @@ elif app == "Admin" and is_admin:
     all_mods = [m["code"] for m in list_all_modules(enabled_only=False)]
     users = list_users()
 
-    # Listado y selección
     st.subheader("Usuarios")
     if not users:
         st.info("No hay usuarios registrados.")
@@ -460,7 +453,6 @@ elif app == "Admin" and is_admin:
 
     colA, colB = st.columns(2)
 
-    # ---- Crear nuevo ----
     with colA:
         st.markdown("### Crear usuario")
         with st.form("create_user_form"):
@@ -484,8 +476,8 @@ elif app == "Admin" and is_admin:
                     st.experimental_rerun()
                 except Exception as e:
                     st.error(f"No se pudo crear: {e}")
+                    st.exception(e)
 
-    # ---- Editar existente ----
     with colB:
         st.markdown("### Editar usuario")
         if idx != "(nuevo)…":
@@ -514,5 +506,7 @@ elif app == "Admin" and is_admin:
                         st.experimental_rerun()
                     except Exception as e:
                         st.error(f"No se pudo actualizar: {e}")
+                        st.exception(e)
             else:
                 st.info("Selecciona un usuario del listado para editar.")
+
