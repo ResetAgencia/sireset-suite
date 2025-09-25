@@ -1,9 +1,13 @@
 # app.py — SiReset (Streamlit)
-# ✅ Listo para copiar y reemplazar
-# - Mantiene Mougli “intacto” (la lógica vive en core/mougli_core.py)
-# - Vista previa y Excel ocultan columnas internas no deseadas
-# - Panel Admin muestra la ruta efectiva de la base de datos (auth.db_path)
+# ✅ “A prueba de balas”: memoria constante, vista previa ligera, modo seguro para archivos enormes.
 
+import gc
+from io import BytesIO
+from pathlib import Path
+import sys
+from typing import Tuple, Optional, List
+
+import pandas as pd
 import streamlit as st
 
 # --- Compatibilidad: experimental_rerun -> rerun ---
@@ -12,19 +16,12 @@ if not hasattr(st, "experimental_rerun"):
         st.rerun()
     st.experimental_rerun = experimental_rerun  # type: ignore
 
-import sys
-from pathlib import Path
-from io import BytesIO
-import inspect
-from typing import Tuple, Optional, List, Dict
-import pandas as pd
-
-# ---- auth imports en una sola línea (mensajes claros si falla) ----
+# ---- auth imports ----
 try:
     from auth import (
         login_ui, current_user, logout_button,
         list_users, create_user, update_user, set_password, list_all_modules,
-        db_path as _db_path,  # para mostrar ruta de BD en Admin
+        DB_PATH as AUTH_DB_PATH,   # mostrar ruta real de la BD
     )
 except Exception as e:
     st.error(f"No pude importar el módulo de autenticación (auth.py): {e}")
@@ -32,7 +29,10 @@ except Exception as e:
 
 # ---------- Config general ----------
 st.set_page_config(page_title="SiReset", layout="wide")
-st.image("assets/Encabezado.png", use_container_width=True)
+try:
+    st.image("assets/Encabezado.png", use_container_width=True)
+except Exception:
+    pass
 
 # --- asegurar import de 'core'
 APP_ROOT = Path(__file__).parent.resolve()
@@ -71,12 +71,8 @@ def require_any(preferido: str, *alternativos: str):
     st.stop()
 
 
-# Resolver funciones/exportaciones de mougli_core (sin tocar Mougli)
-procesar_monitor_outview = require_any(
-    "procesar_monitor_outview",
-    "procesar_monitor_outview_v2",
-    "procesar_outview_monitor",
-)
+# Resolver funciones/exportaciones de mougli_core
+procesar_monitor_outview = require_any("procesar_monitor_outview", "procesar_monitor_outview_v2", "procesar_outview_monitor")
 resumen_mougli = require_any("resumen_mougli")
 _read_monitor_txt = require_any("_read_monitor_txt")
 _read_out_robusto = require_any("_read_out_robusto")
@@ -85,70 +81,31 @@ save_monitor_factors = require_any("save_monitor_factors")
 load_outview_factor = require_any("load_outview_factor")
 save_outview_factor = require_any("save_outview_factor")
 
+# --------- Helpers y constantes “a prueba de balas” ---------
+BAD_TIPOS = {"INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
+             "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"}
 
-def llamar_procesar_monitor_outview(monitor_file, out_file, factores, outview_factor):
-    """Llama a procesar_monitor_outview tolerando firmas distintas."""
-    try:
-        sig = inspect.signature(procesar_monitor_outview).parameters
-        if "outview_factor" in sig:
-            return procesar_monitor_outview(
-                monitor_file, out_file, factores=factores, outview_factor=outview_factor
-            )
-        else:
-            return procesar_monitor_outview(monitor_file, out_file, factores=factores)
-    except TypeError:
-        try:
-            return procesar_monitor_outview(monitor_file, out_file, factores, outview_factor)
-        except TypeError:
-            return procesar_monitor_outview(monitor_file, out_file, factores)
-
-
-# --------- Helpers de UI y datos ---------
-BAD_TIPOS = {
-    "INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
-    "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"
-}
-
-# Columnas internas que NO deben verse en PREVIEW (pero el Excel ya las oculta desde mougli_core)
-# Nota: la limpieza en preview es *case-insensitive* y tolera espacios.
+# Columnas internas que NO deben verse en PREVIEW (Excel ya viene limpio desde core)
 HIDE_OUT_PREVIEW = {
-    "Código único",
-    "Denominador",
-    "Código +1 pieza",
-    "Tarifa × Superficie",
-    "Semana en Mes por Código",
-    "NB_EXTRAE_6_7",
-    "Fecha_AB",
-    "Proveedor_AC",
-    "TipoElemento_AD",
-    "Distrito_AE",
-    "Avenida_AF",
-    "NroCalleCuadra_AG",
-    "OrientacionVia_AH",
-    "Marca_AI",
-    "Conteo_AB_AI",
-    "Conteo_Z_AB_AI",
-    "TarifaS_div3",
-    "TarifaS_div3_sobre_Conteo",
-    "Suma_AM_Z_AB_AI",
-    "TopeTipo_AQ",
-    "Suma_AM_Topada_Tipo",
-    "SumaTopada_div_ConteoZ",
-    # ⚠️ NO ocultar: "+1 Superficie", "Conteo mensual", "Tarifa Real ($)",
-    # "Q versiones por elemento Mes"
+    "Código único","Denominador","Código +1 pieza","Tarifa × Superficie",
+    "Semana en Mes por Código","NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD",
+    "Distrito_AE","Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI",
+    "Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
+    "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ",
 }
+
+# Límites de seguridad
+HEAVY_BYTES = 180 * 1024 * 1024   # ~180 MB totales subidos
+HEAVY_ROWS_PREVIEW = 300_000      # si supera, no hacemos vista previa
+MAX_PREVIEW_ROWS = 1_000          # filas mostradas en preview ligera
+
 
 def _unique_list_str(series, max_items=50):
     if series is None:
         return "—"
     vals = (
-        series.astype(str)
-        .str.strip()
-        .replace({"nan": ""})
-        .dropna()
-        .loc[lambda s: s.str.len() > 0]
-        .unique()
-        .tolist()
+        series.astype(str).str.strip().replace({"nan": ""}).dropna()
+        .loc[lambda s: s.str.len() > 0].unique().tolist()
     )
     if not vals:
         return "—"
@@ -156,6 +113,7 @@ def _unique_list_str(series, max_items=50):
     if len(vals) > max_items:
         return ", ".join(vals[:max_items]) + f" … (+{len(vals)-max_items} más)"
     return ", ".join(vals)
+
 
 def _web_resumen_enriquecido(df: Optional[pd.DataFrame], *, es_monitor: bool) -> pd.DataFrame:
     base = resumen_mougli(df, es_monitor=es_monitor) if df is not None else None
@@ -183,6 +141,7 @@ def _web_resumen_enriquecido(df: Optional[pd.DataFrame], *, es_monitor: bool) ->
 
     return base_vertical
 
+
 def _scan_alertas(df: Optional[pd.DataFrame], *, es_monitor: bool) -> List[str]:
     if df is None or df.empty:
         return []
@@ -190,14 +149,7 @@ def _scan_alertas(df: Optional[pd.DataFrame], *, es_monitor: bool) -> List[str]:
     tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
     tipo_col = next((c for c in tipo_cols if c in df.columns), None)
     if tipo_col:
-        tipos = (
-            df[tipo_col]
-            .astype(str)
-            .str.upper()
-            .str.strip()
-            .replace({"NAN": ""})
-            .dropna()
-        )
+        tipos = df[tipo_col].astype(str).str.upper().str.strip().replace({"NAN": ""}).dropna()
         malos = sorted(set([t for t in tipos.unique() if t in BAD_TIPOS]))
         if malos:
             alerts.append("Se detectaron valores en TIPO ELEMENTO: " + ", ".join(malos))
@@ -208,6 +160,7 @@ def _scan_alertas(df: Optional[pd.DataFrame], *, es_monitor: bool) -> List[str]:
         if fuera:
             alerts.append("Regiones distintas de LIMA detectadas: " + ", ".join(fuera))
     return alerts
+
 
 def _read_out_file_to_df(upload) -> pd.DataFrame:
     name = (getattr(upload, "name", "") or "").lower()
@@ -229,6 +182,7 @@ def _read_out_file_to_df(upload) -> pd.DataFrame:
             return pd.read_csv(upload, sep=";", encoding="latin-1")
         except Exception:
             return pd.DataFrame()
+
 
 def combinar_monitor_txt(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
     if not files:
@@ -253,6 +207,7 @@ def combinar_monitor_txt(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFram
         df_m = None
     return buf, df_m
 
+
 def combinar_outview(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
     if not files:
         return None, None
@@ -273,19 +228,26 @@ def combinar_outview(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
         pass
     return out, dfc
 
+
 def _preview_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Limpia columnas internas SOLO para la vista previa (no toca el Excel)."""
     if df is None or df.empty:
         return pd.DataFrame()
-    # limpieza robusta: normaliza a minúsculas y quita espacios
     normalized_hide = {c.strip().lower() for c in HIDE_OUT_PREVIEW}
-    cols_to_drop = []
-    for c in df.columns:
-        if c and c.strip().lower() in normalized_hide:
-            cols_to_drop.append(c)
+    cols_to_drop = [c for c in df.columns if c and c.strip().lower() in normalized_hide]
     if cols_to_drop:
         return df.drop(columns=cols_to_drop, errors="ignore").copy()
     return df.copy()
+
+
+def _size_of_uploads(files) -> int:
+    total = 0
+    for f in files or []:
+        try:
+            total += getattr(f, "size", 0) or len(f.getvalue())
+        except Exception:
+            pass
+    return total
 
 
 # ------------------- LOGIN (obligatorio) -------------------
@@ -307,7 +269,7 @@ if "mougli" in mods:
     allowed.append("Mougli")
 if "mapito" in mods:
     allowed.append("Mapito")
-# Si es admin, habilita el panel de administración
+# Admin
 is_admin = (user.get("role") == "admin")
 if is_admin:
     allowed.append("Admin")
@@ -357,15 +319,22 @@ if app == "Mougli":
             label_visibility="collapsed", accept_multiple_files=True
         )
 
+    # Detección de modo seguro por tamaño subido
+    total_bytes = _size_of_uploads(up_monitor_multi) + _size_of_uploads(up_out_multi)
+    heavy_upload = total_bytes > HEAVY_BYTES
+    if heavy_upload:
+        st.info("⚙️ Modo seguro activado por tamaño de archivos. La vista previa será limitada y la exportación optimizada.")
+
     st.write("")
     if st.button("Procesar Mougli", type="primary"):
         try:
-            mon_proc, df_m_res = combinar_monitor_txt(up_monitor_multi or [])
-            out_proc, df_o_res = combinar_outview(up_out_multi or [])
+            with st.spinner("Procesando archivos..."):
+                mon_proc, df_m_res = combinar_monitor_txt(up_monitor_multi or [])
+                out_proc, df_o_res = combinar_outview(up_out_multi or [])
 
-            df_result, xlsx = llamar_procesar_monitor_outview(
-                mon_proc, out_proc, factores=factores, outview_factor=out_factor
-            )
+                df_result, xlsx = procesar_monitor_outview(
+                    mon_proc, out_proc, factores=factores, outview_factor=out_factor
+                )
 
             st.success("¡Listo! ✅")
 
@@ -392,25 +361,51 @@ if app == "Mougli":
                         df_o_res = None
                 st.dataframe(_web_resumen_enriquecido(df_o_res, es_monitor=False), use_container_width=True)
 
+            # Alertas
             issues: List[str] = []
             issues += _scan_alertas(df_m_res, es_monitor=True)
             issues += _scan_alertas(df_o_res, es_monitor=False)
             if issues:
                 st.warning("⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues))
 
-            st.download_button(
-                "Descargar Excel",
-                data=xlsx.getvalue(),
-                file_name="SiReset_Mougli.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            # Descargas: XLSX (seguro) y CSV rápido (del resultado principal)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button(
+                    "Descargar Excel (seguro)",
+                    data=xlsx.getvalue(),
+                    file_name="SiReset_Mougli.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            with c2:
+                try:
+                    csv_data = df_result.to_csv(index=False).encode("utf-8")
+                except Exception:
+                    csv_data = b""
+                st.download_button(
+                    "Descargar CSV (rápido)",
+                    data=csv_data,
+                    file_name="SiReset_Mougli.csv",
+                    mime="text/csv",
+                )
 
+            # Vista previa ligera
             st.markdown("### Vista previa")
-            prev = _preview_df(df_result)
-            st.dataframe(prev.head(100), use_container_width=True)
+            rows = len(df_result) if df_result is not None else 0
+            if heavy_upload or rows > HEAVY_ROWS_PREVIEW:
+                st.info(f"Vista previa limitada por tamaño (filas totales: {rows:,}). Se muestran las primeras {MAX_PREVIEW_ROWS:,} filas.")
+                prev = _preview_df(df_result).head(MAX_PREVIEW_ROWS)
+                st.dataframe(prev, use_container_width=True)
+            else:
+                prev = _preview_df(df_result).head(MAX_PREVIEW_ROWS)
+                st.dataframe(prev, use_container_width=True)
+
+            del prev, df_result, df_m_res, df_o_res
+            gc.collect()
 
         except Exception as e:
             st.error(f"Ocurrió un error procesando: {e}")
+            gc.collect()
 
 # =============== M A P I T O ===============
 elif app == "Mapito":
@@ -448,10 +443,8 @@ elif app == "Mapito":
 # =============== A D M I N ===============
 elif app == "Admin" and is_admin:
     st.header("Administración de usuarios")
-
-    # Mostrar ruta efectiva de la BD (para evitar “BDs distintas”)
     try:
-        st.caption(f"📦 Base de datos: `{_db_path()}`")
+        st.caption(f"📦 Base de datos: `{AUTH_DB_PATH}`")
     except Exception:
         pass
 
@@ -523,5 +516,3 @@ elif app == "Admin" and is_admin:
                         st.error(f"No se pudo actualizar: {e}")
             else:
                 st.info("Selecciona un usuario del listado para editar.")
-
-
