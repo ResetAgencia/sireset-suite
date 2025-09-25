@@ -1,78 +1,106 @@
-# app.py — SiReset (Streamlit)
-# ✅ “A prueba de balas”: memoria constante, vista previa ligera, modo seguro para archivos enormes.
+# app.py — SiReset (Streamlit) con worker a prueba de fallos (fix: no tocar key del uploader en callbacks)
+from __future__ import annotations
 
-import gc
-from io import BytesIO
-from pathlib import Path
+import os
 import sys
-from typing import Tuple, Optional, List
+import json
+import uuid
+import shutil
+from pathlib import Path
+from io import BytesIO
+from typing import Optional, List, Dict
 
 import pandas as pd
 import streamlit as st
+from subprocess import Popen
 
-# --- Compatibilidad: experimental_rerun -> rerun ---
-if not hasattr(st, "experimental_rerun"):
-    def experimental_rerun():
-        st.rerun()
-    st.experimental_rerun = experimental_rerun  # type: ignore
-
-# ---- auth imports ----
-try:
-    from auth import (
-        login_ui, current_user, logout_button,
-        list_users, create_user, update_user, set_password, list_all_modules,
-        DB_PATH as AUTH_DB_PATH,   # mostrar ruta real de la BD
-    )
-except Exception as e:
-    st.error(f"No pude importar el módulo de autenticación (auth.py): {e}")
-    st.stop()
-
-# ---------- Config general ----------
+# ─────────────────────────── Config general ───────────────────────────
 st.set_page_config(page_title="SiReset", layout="wide")
 try:
-    st.image("assets/Encabezado.png", use_container_width=True)
+    st.image("assets/Encabezado.png", width="stretch")
 except Exception:
     pass
 
-# --- asegurar import de 'core'
 APP_ROOT = Path(__file__).parent.resolve()
 for p in (APP_ROOT, APP_ROOT / "core"):
     sp = str(p)
     if sp not in sys.path:
         sys.path.insert(0, sp)
 
-# --- Importar mougli_core (módulo completo) y resolver símbolos
+# Asegura que core sea paquete (para import -m)
+CORE_DIR = APP_ROOT / "core"
 try:
-    import core.mougli_core as mc
-except Exception as e:
-    st.error(
-        "No pude importar core.mougli_core. Verifica que exista la carpeta *core/* al lado de app.py "
-        "y que dentro esté mougli_core.py.\n\n"
-        f"Detalle técnico: {e}"
+    if CORE_DIR.exists():
+        init_py = CORE_DIR / "__init__.py"
+        if not init_py.exists():
+            init_py.write_text("# auto-created to mark 'core' as a package\n", encoding="utf-8")
+except Exception:
+    pass
+
+# ───────────────────── Imports de auth y core robustos ───────────────────────
+def _import_mougli_core():
+    try:
+        import core.mougli_core as mc
+        return mc, "pkg"
+    except Exception as e1:
+        err1 = f"core.mougli_core: {e1}"
+    try:
+        import mougli_core as mc
+        return mc, "flat"
+    except Exception as e2:
+        err2 = f"mougli_core: {e2}"
+    try:
+        from importlib.machinery import SourceFileLoader
+        mod_path = CORE_DIR / "mougli_core.py"
+        if not mod_path.exists():
+            mod_path = APP_ROOT / "mougli_core.py"
+        mc = SourceFileLoader("mougli_core", str(mod_path)).load_module()
+        return mc, "path"
+    except Exception as e3:
+        st.error(
+            "No pude importar *mougli_core* por ninguna ruta.\n\n"
+            f"- {err1}\n- {err2}\n- loader: {e3}\n\n"
+            f"Busqué en: {CORE_DIR}/mougli_core.py y {APP_ROOT}/mougli_core.py"
+        )
+        st.stop()
+
+mc, _mc_mode = _import_mougli_core()
+
+try:
+    from auth import (
+        login_ui, current_user, logout_button,
+        list_users, create_user, update_user, set_password, list_all_modules,
+        _connect as _db_connect
     )
+    def _db_path():
+        try:
+            con = _db_connect()
+            row = con.execute("PRAGMA database_list;").fetchone()
+            try:
+                con.close()
+            except Exception:
+                pass
+            return row["file"] if row else "(desconocida)"
+        except Exception:
+            return "(ruta no disponible)"
+except Exception as e:
+    st.error(f"No pude importar el módulo de autenticación (auth.py): {e}")
     st.stop()
 
-
 def require_any(preferido: str, *alternativos: str):
-    """Devuelve la primera función disponible entre preferido y alias."""
     candidatos = (preferido, *alternativos)
     for name in candidatos:
         fn = getattr(mc, name, None)
         if callable(fn):
-            if name != preferido:
-                st.info(f"Usando {name}() como alias de {preferido}().")
             return fn
     exports = sorted([x for x in dir(mc) if not x.startswith("_")])
     st.error(
-        f"No encontré la función *{preferido}* en core/mougli_core.py.\n\n"
-        f"Alias probados: {', '.join(alternativos) or '—'}\n\n"
-        f"Funciones visibles en el módulo: {', '.join(exports) or '—'}"
+        f"No encontré la función *{preferido}* en mougli_core.\n"
+        f"Funciones visibles: {', '.join(exports) or '—'}"
     )
     st.stop()
 
-
-# Resolver funciones/exportaciones de mougli_core
-procesar_monitor_outview = require_any("procesar_monitor_outview", "procesar_monitor_outview_v2", "procesar_outview_monitor")
+procesar_monitor_outview = require_any("procesar_monitor_outview")
 resumen_mougli = require_any("resumen_mougli")
 _read_monitor_txt = require_any("_read_monitor_txt")
 _read_out_robusto = require_any("_read_out_robusto")
@@ -81,31 +109,35 @@ save_monitor_factors = require_any("save_monitor_factors")
 load_outview_factor = require_any("load_outview_factor")
 save_outview_factor = require_any("save_outview_factor")
 
-# --------- Helpers y constantes “a prueba de balas” ---------
-BAD_TIPOS = {"INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
-             "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"}
+# ───────────────────────── Helpers y constantes ──────────────────────────────
+JOBS_DIR = APP_ROOT / "jobs"
+JOBS_DIR.mkdir(exist_ok=True)
 
-# Columnas internas que NO deben verse en PREVIEW (Excel ya viene limpio desde core)
-HIDE_OUT_PREVIEW = {
-    "Código único","Denominador","Código +1 pieza","Tarifa × Superficie",
-    "Semana en Mes por Código","NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD",
-    "Distrito_AE","Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI",
-    "Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
-    "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ",
+BAD_TIPOS = {
+    "INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
+    "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"
 }
 
-# Límites de seguridad
-HEAVY_BYTES = 180 * 1024 * 1024   # ~180 MB totales subidos
-HEAVY_ROWS_PREVIEW = 300_000      # si supera, no hacemos vista previa
-MAX_PREVIEW_ROWS = 1_000          # filas mostradas en preview ligera
-
+HIDE_OUT_PREVIEW = {
+    "Código único","Denominador","Código +1 pieza","Tarifa × Superficie",
+    "Semana en Mes por Código","NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC",
+    "TipoElemento_AD","Distrito_AE","Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH",
+    "Marca_AI","Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
+    "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ",
+    "K_UNICO","K_PIEZA"
+}
 
 def _unique_list_str(series, max_items=50):
     if series is None:
         return "—"
     vals = (
-        series.astype(str).str.strip().replace({"nan": ""}).dropna()
-        .loc[lambda s: s.str.len() > 0].unique().tolist()
+        series.astype(str)
+        .str.strip()
+        .replace({"nan": ""})
+        .dropna()
+        .loc[lambda s: s.str.len() > 0]
+        .unique()
+        .tolist()
     )
     if not vals:
         return "—"
@@ -114,14 +146,12 @@ def _unique_list_str(series, max_items=50):
         return ", ".join(vals[:max_items]) + f" … (+{len(vals)-max_items} más)"
     return ", ".join(vals)
 
-
 def _web_resumen_enriquecido(df: Optional[pd.DataFrame], *, es_monitor: bool) -> pd.DataFrame:
     base = resumen_mougli(df, es_monitor=es_monitor) if df is not None else None
     if base is None or base.empty:
         base = pd.DataFrame([{"Filas": 0, "Rango de fechas": "—", "Marcas / Anunciantes": 0}])
     base_vertical = pd.DataFrame({"Descripción": base.columns, "Valor": base.iloc[0].tolist()})
 
-    # columnas extra
     cat_col = "CATEGORIA" if es_monitor else ("Categoría" if (df is not None and "Categoría" in df.columns) else None)
     reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if (df is not None and "Región" in df.columns) else None)
     tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
@@ -141,135 +171,108 @@ def _web_resumen_enriquecido(df: Optional[pd.DataFrame], *, es_monitor: bool) ->
 
     return base_vertical
 
-
-def _scan_alertas(df: Optional[pd.DataFrame], *, es_monitor: bool) -> List[str]:
-    if df is None or df.empty:
-        return []
-    alerts = []
-    tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
-    tipo_col = next((c for c in tipo_cols if c in df.columns), None)
-    if tipo_col:
-        tipos = df[tipo_col].astype(str).str.upper().str.strip().replace({"NAN": ""}).dropna()
-        malos = sorted(set([t for t in tipos.unique() if t in BAD_TIPOS]))
-        if malos:
-            alerts.append("Se detectaron valores en TIPO ELEMENTO: " + ", ".join(malos))
-    reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if ("Región" in df.columns) else None)
-    if reg_col and reg_col in df.columns:
-        regiones = df[reg_col].astype(str).str.upper().str.strip().replace({"NAN": ""}).dropna()
-        fuera = sorted(set([r for r in regiones.unique() if r and r != "LIMA"]))
-        if fuera:
-            alerts.append("Regiones distintas de LIMA detectadas: " + ", ".join(fuera))
-    return alerts
-
-
-def _read_out_file_to_df(upload) -> pd.DataFrame:
-    name = (getattr(upload, "name", "") or "").lower()
-    try:
-        upload.seek(0)
-    except Exception:
-        pass
-    try:
-        if name.endswith(".csv"):
-            try:
-                return pd.read_csv(upload)
-            except UnicodeDecodeError:
-                upload.seek(0)
-                return pd.read_csv(upload, sep=";", encoding="latin-1")
-        return pd.read_excel(upload)
-    except Exception:
-        try:
-            upload.seek(0)
-            return pd.read_csv(upload, sep=";", encoding="latin-1")
-        except Exception:
-            return pd.DataFrame()
-
-
-def combinar_monitor_txt(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
-    if not files:
-        return None, None
-    buf = BytesIO()
-    for i, f in enumerate(files):
-        data = f.getvalue()
-        if i > 0:
-            buf.write(b"\n")
-        buf.write(data)
-    buf.seek(0)
-    try:
-        setattr(buf, "name", "monitor_combined.txt")
-    except Exception:
-        pass
-    df_m = None
-    try:
-        buf.seek(0)
-        df_m = _read_monitor_txt(buf)
-        buf.seek(0)
-    except Exception:
-        df_m = None
-    return buf, df_m
-
-
-def combinar_outview(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
-    if not files:
-        return None, None
-    dfs = []
-    for f in files:
-        df = _read_out_file_to_df(f)
-        if df is not None and not df.empty:
-            dfs.append(df)
-    if not dfs:
-        return None, None
-    dfc = pd.concat(dfs, ignore_index=True)
-    out = BytesIO()
-    dfc.to_csv(out, index=False)
-    out.seek(0)
-    try:
-        setattr(out, "name", "outview_combined.csv")
-    except Exception:
-        pass
-    return out, dfc
-
-
 def _preview_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Limpia columnas internas SOLO para la vista previa (no toca el Excel)."""
     if df is None or df.empty:
         return pd.DataFrame()
     normalized_hide = {c.strip().lower() for c in HIDE_OUT_PREVIEW}
     cols_to_drop = [c for c in df.columns if c and c.strip().lower() in normalized_hide]
-    if cols_to_drop:
-        return df.drop(columns=cols_to_drop, errors="ignore").copy()
-    return df.copy()
+    return df.drop(columns=cols_to_drop, errors="ignore").copy()
 
-
-def _size_of_uploads(files) -> int:
-    total = 0
+# ──────────────────────────── Worker management ───────────────────────────────
+def _save_upload_to(job_dir: Path, files, subdir: str) -> List[Path]:
+    outdir = job_dir / "uploads" / subdir
+    outdir.mkdir(parents=True, exist_ok=True)
+    paths = []
     for f in files or []:
+        name = getattr(f, "name", f"file-{uuid.uuid4().hex}")
+        dest = outdir / name
+        with dest.open("wb") as w:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                if not chunk:
+                    break
+                w.write(chunk)
         try:
-            total += getattr(f, "size", 0) or len(f.getvalue())
+            f.seek(0)
         except Exception:
             pass
-    return total
+        paths.append(dest)
+    return paths
 
+def _start_worker(job_dir: Path, mon_paths: List[Path], out_paths: List[Path],
+                  factores: Dict[str, float], out_factor: float):
+    progress = job_dir / "progress.json"
+    logf = job_dir / "job.log"
+    outxlsx = job_dir / "SiReset_Mougli.xlsx"
 
-# ------------------- LOGIN (obligatorio) -------------------
+    core_pkg_ok = (CORE_DIR / "__init__.py").exists() and (CORE_DIR / "mougli_core.py").exists()
+    if core_pkg_ok:
+        base_cmd = [sys.executable, "-m", "core.mougli_core"]
+    else:
+        script_path = CORE_DIR / "mougli_core.py"
+        if not script_path.exists():
+            script_path = APP_ROOT / "mougli_core.py"
+        base_cmd = [sys.executable, str(script_path)]
+
+    args = base_cmd + [
+        "--as-worker",
+        "--out-xlsx", str(outxlsx),
+        "--progress", str(progress),
+        "--log", str(logf),
+        "--job-dir", str(job_dir),
+        "--factores-json", json.dumps(factores),
+        "--outview-factor", str(out_factor),
+    ]
+    for p in mon_paths:
+        args.extend(["--monitor", str(p)])
+    for p in out_paths:
+        args.extend(["--outview", str(p)])
+
+    Popen(args, cwd=str(APP_ROOT))
+    progress.write_text(json.dumps({"status": "running", "step": 0, "total": 6, "message": "Inicializando…"}), encoding="utf-8")
+
+def _read_progress(job_dir: Path) -> Dict:
+    pj = job_dir / "progress.json"
+    if pj.exists():
+        try:
+            return json.loads(pj.read_text(encoding="utf-8"))
+        except Exception:
+            return {"status": "unknown", "message": "progress.json corrupto"}
+    return {"status": "unknown", "message": "sin progreso"}
+
+def _read_log_tail(job_dir: Path, lines: int = 200) -> str:
+    logf = job_dir / "job.log"
+    if not logf.exists():
+        return ""
+    try:
+        data = logf.read_text(encoding="utf-8", errors="ignore").splitlines()
+        return "\n".join(data[-lines:])
+    except Exception:
+        return ""
+
+def _clear_job(job_id: str):
+    job_dir = JOBS_DIR / job_id
+    if job_dir.exists():
+        shutil.rmtree(job_dir, ignore_errors=True)
+    if "job_id" in st.session_state:
+        del st.session_state["job_id"]
+
+# ─────────────────────────────── LOGIN obligatorio ───────────────────────────
 user = current_user()
 if not user:
     login_ui()
     st.stop()
 
-# Sidebar: saludo + logout
 with st.sidebar:
     st.markdown(f"**Usuario:** {user.get('name') or user.get('email', '—')}")
     st.markdown(f"**Rol:** {user.get('role', '—')}")
     logout_button()
 
-# ------------------- Apps permitidas por usuario -------------------
 mods = [str(m).lower() for m in (user.get("modules") or [])]
 allowed: List[str] = []
 if "mougli" in mods:
     allowed.append("Mougli")
 if "mapito" in mods:
     allowed.append("Mapito")
-# Admin
 is_admin = (user.get("role") == "admin")
 if is_admin:
     allowed.append("Admin")
@@ -278,7 +281,6 @@ if not allowed:
     st.warning("Tu usuario no tiene módulos habilitados. Pide acceso a un administrador.")
     st.stop()
 
-# ---------- Sidebar: selector de app ----------
 app = st.sidebar.radio("Elige aplicación", allowed, index=0)
 
 # ---------- Factores SOLO visibles en Mougli ----------
@@ -288,12 +290,12 @@ if app == "Mougli":
     persist_o = load_outview_factor()
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        f_tv = st.number_input("TV", min_value=0.0, step=0.01, value=float(persist_m.get("TV", 0.26)))
-        f_cable = st.number_input("CABLE", min_value=0.0, step=0.01, value=float(persist_m.get("CABLE", 0.42)))
-        f_radio = st.number_input("RADIO", min_value=0.0, step=0.01, value=float(persist_m.get("RADIO", 0.42)))
+        f_tv = st.number_input("TV", min_value=0.0, step=0.01, value=float(persist_m.get("TV", 0.255)))
+        f_cable = st.number_input("CABLE", min_value=0.0, step=0.01, value=float(persist_m.get("CABLE", 0.425)))
+        f_radio = st.number_input("RADIO", min_value=0.0, step=0.01, value=float(persist_m.get("RADIO", 0.425)))
     with col2:
-        f_revista = st.number_input("REVISTA", min_value=0.0, step=0.01, value=float(persist_m.get("REVISTA", 0.15)))
-        f_diarios = st.number_input("DIARIOS", min_value=0.0, step=0.01, value=float(persist_m.get("DIARIOS", 0.15)))
+        f_revista = st.number_input("REVISTA", min_value=0.0, step=0.01, value=float(persist_m.get("REVISTA", 0.14875)))
+        f_diarios = st.number_input("DIARIOS", min_value=0.0, step=0.01, value=float(persist_m.get("DIARIOS", 0.14875)))
         out_factor = st.number_input("OutView ×Superficie", min_value=0.0, step=0.05, value=float(persist_o))
     factores = {"TV": f_tv, "CABLE": f_cable, "RADIO": f_radio, "REVISTA": f_revista, "DIARIOS": f_diarios}
     if st.sidebar.button("💾 Guardar factores"):
@@ -301,111 +303,210 @@ if app == "Mougli":
         save_outview_factor(out_factor)
         st.sidebar.success("Factores guardados.")
 
-# =============== M O U G L I ===============
+# =============== M O U G L I (con worker) ===============
 if app == "Mougli":
-    st.markdown("## Mougli – Monitor & OutView")
+    import gc
 
-    colL, colR = st.columns(2)
-    with colL:
-        st.caption("Sube Monitor (.txt) — puedes subir varios")
-        up_monitor_multi = st.file_uploader(
-            "Arrastra y suelta aquí", type=["txt"], key="m_txt_multi",
-            label_visibility="collapsed", accept_multiple_files=True
-        )
-    with colR:
-        st.caption("Sube OutView (.csv / .xlsx) — puedes subir varios")
-        up_out_multi = st.file_uploader(
-            "Arrastra y suelta aquí", type=["csv", "xlsx"], key="o_multi",
-            label_visibility="collapsed", accept_multiple_files=True
-        )
+    st.markdown("## Mougli – Monitor & OutView (seguro)")
 
-    # Detección de modo seguro por tamaño subido
-    total_bytes = _size_of_uploads(up_monitor_multi) + _size_of_uploads(up_out_multi)
-    heavy_upload = total_bytes > HEAVY_BYTES
-    if heavy_upload:
-        st.info("⚙️ Modo seguro activado por tamaño de archivos. La vista previa será limitada y la exportación optimizada.")
+    # ---------- Estado de worker en curso ----------
+    job_id = st.session_state.get("job_id")
+    if job_id:
+        job_dir = JOBS_DIR / job_id
+        prog = _read_progress(job_dir)
+        st.info(f"Trabajo en curso: `{job_id}`")
+        colP, colBtns = st.columns([3,1])
+        with colP:
+            step = int(prog.get("step", 0))
+            total = int(prog.get("total", 6) or 6)
+            st.progress(min(step, total) / max(total, 1), text=prog.get("message", "Procesando…"))
+        with colBtns:
+            if st.button("↻ Actualizar"):
+                st.rerun()
+            if st.button("Cancelar / Limpiar"):
+                _clear_job(job_id)
+                st.rerun()
 
-    st.write("")
-    if st.button("Procesar Mougli", type="primary"):
-        try:
-            with st.spinner("Procesando archivos..."):
-                mon_proc, df_m_res = combinar_monitor_txt(up_monitor_multi or [])
-                out_proc, df_o_res = combinar_outview(up_out_multi or [])
+        with st.expander("Ver registro (log)"):
+            st.code(_read_log_tail(job_dir), language="text")
 
-                df_result, xlsx = procesar_monitor_outview(
-                    mon_proc, out_proc, factores=factores, outview_factor=out_factor
-                )
-
-            st.success("¡Listo! ✅")
-
-            colA, colB = st.columns(2)
-            with colA:
-                st.markdown("#### Monitor")
-                if df_m_res is None and mon_proc is not None:
-                    try:
-                        mon_proc.seek(0)
-                        df_m_res = _read_monitor_txt(mon_proc)
-                        mon_proc.seek(0)
-                    except Exception:
-                        df_m_res = None
-                st.dataframe(_web_resumen_enriquecido(df_m_res, es_monitor=True), use_container_width=True)
-
-            with colB:
-                st.markdown("#### OutView")
-                if df_o_res is None and out_proc is not None:
-                    try:
-                        out_proc.seek(0)
-                        df_o_res = _read_out_robusto(out_proc)
-                        out_proc.seek(0)
-                    except Exception:
-                        df_o_res = None
-                st.dataframe(_web_resumen_enriquecido(df_o_res, es_monitor=False), use_container_width=True)
-
-            # Alertas
-            issues: List[str] = []
-            issues += _scan_alertas(df_m_res, es_monitor=True)
-            issues += _scan_alertas(df_o_res, es_monitor=False)
-            if issues:
-                st.warning("⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues))
-
-            # Descargas: XLSX (seguro) y CSV rápido (del resultado principal)
-            c1, c2 = st.columns(2)
-            with c1:
+        if prog.get("status") == "done":
+            outxlsx = job_dir / "SiReset_Mougli.xlsx"
+            if outxlsx.exists():
+                st.success("¡Listo! ✅ Descarga tu Excel.")
                 st.download_button(
-                    "Descargar Excel (seguro)",
-                    data=xlsx.getvalue(),
+                    "Descargar Excel",
+                    data=outxlsx.read_bytes(),
                     file_name="SiReset_Mougli.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-            with c2:
-                try:
-                    csv_data = df_result.to_csv(index=False).encode("utf-8")
-                except Exception:
-                    csv_data = b""
-                st.download_button(
-                    "Descargar CSV (rápido)",
-                    data=csv_data,
-                    file_name="SiReset_Mougli.csv",
-                    mime="text/csv",
-                )
-
-            # Vista previa ligera
-            st.markdown("### Vista previa")
-            rows = len(df_result) if df_result is not None else 0
-            if heavy_upload or rows > HEAVY_ROWS_PREVIEW:
-                st.info(f"Vista previa limitada por tamaño (filas totales: {rows:,}). Se muestran las primeras {MAX_PREVIEW_ROWS:,} filas.")
-                prev = _preview_df(df_result).head(MAX_PREVIEW_ROWS)
-                st.dataframe(prev, use_container_width=True)
             else:
-                prev = _preview_df(df_result).head(MAX_PREVIEW_ROWS)
-                st.dataframe(prev, use_container_width=True)
+                st.warning("El proceso terminó pero no encontré el archivo de salida.")
+        elif prog.get("status") == "error":
+            st.error(f"El worker reportó un error: {prog.get('message')}")
+        st.stop()
 
-            del prev, df_result, df_m_res, df_o_res
-            gc.collect()
+    # ---------- Estado para nonces de uploaders ----------
+    if "m_nonce" not in st.session_state:
+        st.session_state["m_nonce"] = 0
+    if "o_nonce" not in st.session_state:
+        st.session_state["o_nonce"] = 0
 
-        except Exception as e:
-            st.error(f"Ocurrió un error procesando: {e}")
-            gc.collect()
+    def _ensure_pending_job():
+        jid = st.session_state.get("pending_job_id")
+        if not jid:
+            jid = uuid.uuid4().hex[:12]
+            st.session_state["pending_job_id"] = jid
+        job_dir = JOBS_DIR / jid
+        job_dir.mkdir(parents=True, exist_ok=True)
+        return jid, job_dir
+
+    def _stage_files(kind: str, files):
+        if not files:
+            return []
+        _, job_dir = _ensure_pending_job()
+        return _save_upload_to(job_dir, files, kind)
+
+    # ---------- Callbacks (NO tocan el key del widget) ----------
+    def _on_upload_monitor(u_key: str):
+        files = st.session_state.get(u_key) or []
+        _stage_files("monitor", files)
+        st.session_state["m_nonce"] += 1  # fuerza un nuevo key → uploader vacío
+        st.rerun()
+
+    def _on_upload_out(u_key: str):
+        files = st.session_state.get(u_key) or []
+        _stage_files("outview", files)
+        st.session_state["o_nonce"] += 1
+        st.rerun()
+
+    # ---------- Carga con keys únicos por nonce ----------
+    colL, colR = st.columns(2)
+    with colL:
+        st.caption("Sube Monitor (.txt) — puedes subir varios (se guardan inmediatamente)")
+        m_key = f"m_txt_multi__{st.session_state['m_nonce']}"
+        st.file_uploader(
+            "Arrastra y suelta aquí",
+            type=["txt"],
+            key=m_key,
+            label_visibility="collapsed",
+            accept_multiple_files=True,
+            on_change=_on_upload_monitor,
+            args=(m_key,),
+        )
+    with colR:
+        st.caption("Sube OutView (.csv / .xlsx) — puedes subir varios (se guardan inmediatamente)")
+        o_key = f"o_multi__{st.session_state['o_nonce']}"
+        st.file_uploader(
+            "Arrastra y suelta aquí",
+            type=["csv", "xlsx"],
+            key=o_key,
+            label_visibility="collapsed",
+            accept_multiple_files=True,
+            on_change=_on_upload_out,
+            args=(o_key,),
+        )
+
+    # ---------- Mostrar bandeja de archivos ya volcados a disco ----------
+    jid = st.session_state.get("pending_job_id")
+    mon_paths: List[Path] = []
+    out_paths: List[Path] = []
+    if jid:
+        job_dir = JOBS_DIR / jid
+        mon_paths = sorted((job_dir / "uploads" / "monitor").glob("*"))
+        out_paths = sorted((job_dir / "uploads" / "outview").glob("*"))
+
+    def _fmt_size(p: Path) -> str:
+        try:
+            b = p.stat().st_size
+        except Exception:
+            b = 0
+        mb = b / (1024*1024)
+        return f"{mb:.1f} MB"
+
+    st.markdown("#### Archivos preparados")
+    colA, colB = st.columns(2)
+    with colA:
+        st.write("**Monitor**")
+        if mon_paths:
+            for p in mon_paths:
+                st.write(f"• {p.name} — {_fmt_size(p)}")
+        else:
+            st.caption("— vacío —")
+    with colB:
+        st.write("**OutView**")
+        if out_paths:
+            for p in out_paths:
+                st.write(f"• {p.name} — {_fmt_size(p)}")
+        else:
+            st.caption("— vacío —")
+
+    colBtns1, colBtns2 = st.columns(2)
+    with colBtns1:
+        if st.button("🗑️ Vaciar bandeja"):
+            if jid:
+                _clear_job(jid)
+                st.session_state.pop("pending_job_id", None)
+                st.rerun()
+    with colBtns2:
+        if st.button("🚀 Procesar (seguro, en background)", type="primary"):
+            if not (mon_paths or out_paths):
+                st.warning("Primero sube algún archivo; se guardan al seleccionarlos.")
+            else:
+                try:
+                    _start_worker(JOBS_DIR / jid, mon_paths, out_paths, factores, out_factor)
+                    st.session_state["job_id"] = jid
+                    st.session_state.pop("pending_job_id", None)
+                    st.success("Trabajo lanzado. Puedes seguir usando la app.")
+                    st.rerun()
+                except Exception as e:
+                    _clear_job(jid)
+                    st.error(f"No se pudo iniciar el procesamiento: {e}")
+
+    # ---------- Vistazo rápido (protegido) ----------
+    st.markdown("---")
+    st.markdown("### ¿Solo quieres un vistazo rápido sin procesar todo?")
+    st.caption("Esto carga y muestra **solo resúmenes** para validar archivos (no genera Excel).")
+
+    MAX_PREVIEW_BYTES = 15 * 1024 * 1024  # 15 MB
+
+    colPrevA, colPrevB = st.columns(2)
+    with colPrevA:
+        if mon_paths:
+            total_mb = sum((p.stat().st_size for p in mon_paths if p.exists()), 0) / (1024*1024)
+            if total_mb > 15:
+                st.info("Monitor en bandeja es pesado: se omite preview para evitar cuelgues.")
+            else:
+                try:
+                    buf = BytesIO()
+                    for i, p in enumerate(mon_paths):
+                        with p.open("rb") as f:
+                            if i > 0:
+                                buf.write(b"\n")
+                            buf.write(f.read())
+                    buf.seek(0); setattr(buf, "name", "monitor_preview.txt")
+                    df_m = _read_monitor_txt(buf)
+                    st.dataframe(_web_resumen_enriquecido(df_m, es_monitor=True), width="stretch")
+                except MemoryError:
+                    st.warning("Preview de Monitor omitido por tamaño (protección de memoria).")
+                except Exception as e:
+                    st.error(f"No se pudo leer Monitor: {e}")
+
+    with colPrevB:
+        if out_paths:
+            try:
+                f0 = out_paths[0]
+                if f0.stat().st_size > MAX_PREVIEW_BYTES:
+                    st.info("OutView en bandeja es pesado: se omite preview para evitar cuelgues.")
+                else:
+                    with f0.open("rb") as fh:
+                        setattr(fh, "name", f0.name)
+                        df_o = _read_out_robusto(fh)
+                    st.dataframe(_web_resumen_enriquecido(df_o, es_monitor=False), width="stretch")
+            except MemoryError:
+                st.warning("Preview de OutView omitido por tamaño (protección de memoria).")
+            except Exception as e:
+                st.error(f"No se pudo leer OutView: {e}")
 
 # =============== M A P I T O ===============
 elif app == "Mapito":
@@ -443,15 +544,11 @@ elif app == "Mapito":
 # =============== A D M I N ===============
 elif app == "Admin" and is_admin:
     st.header("Administración de usuarios")
-    try:
-        st.caption(f"📦 Base de datos: `{AUTH_DB_PATH}`")
-    except Exception:
-        pass
+    st.caption(f"📦 Base de datos: `{_db_path()}`")
 
     all_mods = [m["code"] for m in list_all_modules(enabled_only=False)]
     users = list_users()
 
-    # Listado y selección
     st.subheader("Usuarios")
     if not users:
         st.info("No hay usuarios registrados.")
@@ -460,7 +557,6 @@ elif app == "Admin" and is_admin:
 
     colA, colB = st.columns(2)
 
-    # ---- Crear nuevo ----
     with colA:
         st.markdown("### Crear usuario")
         with st.form("create_user_form"):
@@ -481,11 +577,10 @@ elif app == "Admin" and is_admin:
                         active=c_active, modules=c_modules
                     )
                     st.success("Usuario creado.")
-                    st.experimental_rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"No se pudo crear: {e}")
 
-    # ---- Editar existente ----
     with colB:
         st.markdown("### Editar usuario")
         if idx != "(nuevo)…":
@@ -511,9 +606,8 @@ elif app == "Admin" and is_admin:
                         if e_newpwd:
                             set_password(u["id"], e_newpwd)
                         st.success("Cambios guardados.")
-                        st.experimental_rerun()
+                        st.rerun()
                     except Exception as e:
                         st.error(f"No se pudo actualizar: {e}")
             else:
                 st.info("Selecciona un usuario del listado para editar.")
-
