@@ -1,5 +1,5 @@
 # core/mougli_core.py
-# Mougli core + Worker CLI robusto y de baja memoria
+# Mougli core + Worker CLI robusto
 from __future__ import annotations
 
 import io
@@ -154,8 +154,10 @@ def _read_out_robusto(file) -> pd.DataFrame:
     def _fix_tarifa(df: pd.DataFrame) -> pd.DataFrame:
         if "Tarifa S/." in df.columns:
             s = df["Tarifa S/."].astype(str).str.strip()
-            s = s.str.replace(r"(?<=\d)\.(?=\d{3}(\D|$))", "", regex=True)  # miles
-            s = s.str.replace(",", ".", regex=False)                        # coma decimal
+            # quita punto de miles: 180.498 -> 180498
+            s = s.str.replace(r"(?<=\d)\.(?=\d{3}(\D|$))", "", regex=True)
+            # coma decimal -> punto
+            s = s.str.replace(",", ".", regex=False)
             df["Tarifa S/."] = pd.to_numeric(s, errors="coerce")
         return df
 
@@ -253,35 +255,12 @@ def _version_column(df: pd.DataFrame) -> str | None:
     return None
 
 
-def _hash_key(df: pd.DataFrame, cols: List[str]) -> pd.Series:
-    """Hash 64-bit estable por fila sobre un subconjunto de columnas (memoria baja)."""
-    tmp = {}
-    for c in cols:
-        if c in df.columns:
-            s = df[c].astype("string").fillna("")
-        else:
-            s = pd.Series([""] * len(df), dtype="string")
-        tmp[c] = s
-    mini = pd.DataFrame(tmp)
-    return pd.util.hash_pandas_object(mini, index=False).astype("uint64")
-
-
-def _to_category(df: pd.DataFrame, cols: List[str]) -> None:
-    for c in cols:
-        if c in df.columns:
-            try:
-                df[c] = df[c].astype("category")
-            except Exception:
-                pass
-
-
 def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -> pd.DataFrame:
-    """Replica cálculos de OutView (incluye Tarifa Real $) con uso de memoria reducido."""
+    """Replica cálculos de OutView (incluye Tarifa Real $)."""
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = df.copy()
-
     # Normalización de fechas
     df["Fecha"] = pd.to_datetime(df.get("Fecha"), dayfirst=True, errors="coerce")
     df["AÑO"] = df["Fecha"].dt.year
@@ -290,55 +269,59 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     df["_FechaDT"] = df["Fecha"]
     df["_YM"] = df["_FechaDT"].dt.to_period("M")
 
+    safe = lambda v: "" if pd.isna(v) else str(v)
     ver_col = _version_column(df)
 
-    # ====== IDs internos por HASH (sin string gigante) ======
-    cols_unico = ["MES","AÑO","Latitud","Longitud","Avenida","Nro Calle/Cuadra","Marca",
-                  "Tipo Elemento","Orientación de Vía","Tarifa S/.","Proveedor","Distrito","Cod.Proveedor"]
-    cols_pieza = ["NombreBase","Proveedor","Tipo Elemento","Distrito","Orientación de Vía",
-                  "Nro Calle/Cuadra","Item", (ver_col or ""), "Latitud","Longitud","Categoría",
-                  "Tarifa S/.","Anunciante","MES","AÑO","SEMANA"]
-    cols_pieza = [c for c in cols_pieza if c]
+    # Identificadores base
+    df["Código único"] = df.apply(lambda r: "|".join([
+        safe(r.get("MES","")), safe(r.get("AÑO","")), safe(r.get("Latitud","")), safe(r.get("Longitud","")),
+        safe(r.get("Avenida","")), safe(r.get("Nro Calle/Cuadra","")), safe(r.get("Marca","")),
+        safe(r.get("Tipo Elemento","")), safe(r.get("Orientación de Vía","")), safe(r.get("Tarifa S/.","")),
+        safe(r.get("Proveedor","")), safe(r.get("Distrito","")), safe(r.get("Cod.Proveedor",""))
+    ]), axis=1)
 
-    df["K_UNICO"] = _hash_key(df, cols_unico)
-    df["K_PIEZA"] = _hash_key(df, cols_pieza)
+    df["Código +1 pieza"] = df.apply(lambda r: "|".join([
+        safe(r.get("NombreBase","")), safe(r.get("Proveedor","")), safe(r.get("Tipo Elemento","")),
+        safe(r.get("Distrito","")), safe(r.get("Orientación de Vía","")), safe(r.get("Nro Calle/Cuadra","")),
+        safe(r.get("Item","")), safe(r.get(ver_col,"") if ver_col else ""),
+        safe(r.get("Latitud","")), safe(r.get("Longitud","")), safe(r.get("Categoría","")),
+        safe(r.get("Tarifa S/.","")), safe(r.get("Anunciante","")), safe(r.get("MES","")),
+        safe(r.get("AÑO","")), safe(r.get("SEMANA",""))
+    ]), axis=1)
 
-    # ====== Métricas base ======
-    df["Denominador"] = df.groupby("K_UNICO", observed=True, sort=False)["K_UNICO"].transform("size")
-    if ver_col and ver_col in df.columns:
-        df["Q versiones por elemento"] = (
-            df[["K_UNICO", ver_col]]
-            .groupby("K_UNICO", observed=True, sort=False)[ver_col]
-            .transform("nunique")
-        )
+    # Métricas base
+    df["Denominador"] = df.groupby("Código único")["Código único"].transform("size")
+    if ver_col:
+        # nombre visible
+        df["Q versiones por elemento"] = df.groupby("Código único")[ver_col].transform("nunique")
 
-    df["+1 superficie"] = df.groupby("K_PIEZA", observed=True, sort=False)["K_PIEZA"].transform("size")
+    # visible (minúscula exacta pedida)
+    df["+1 superficie"] = df.groupby("Código +1 pieza")["Código +1 pieza"].transform("size")
 
     tarifa_num = pd.to_numeric(df.get("Tarifa S/."), errors="coerce").fillna(0)
-    first_in_piece = (df.groupby("K_PIEZA", observed=True, sort=False).cumcount() == 0)
+    first_in_piece = (df.groupby("Código +1 pieza").cumcount() == 0)
 
+    # interna para cálculo
     df["Tarifa × Superficie"] = np.where(first_in_piece, tarifa_num * df["+1 superficie"], 0.0)
     df["Tarifa × Superficie"] = (df["Tarifa × Superficie"] * float(factor_outview)) / 3.8
 
     df["Semana en Mes por Código"] = (
-        df.sort_values(["K_UNICO","_YM","_FechaDT"])
-          .groupby(["K_UNICO","_YM"], observed=True, sort=False)
-          .cumcount() + 1
+        df.groupby(["Código único","_YM"])["_FechaDT"].transform(lambda s: s.rank(method="dense").astype(int))
     )
     order_in_month = (
-        df.sort_values(["K_UNICO","_YM","_FechaDT"])
-          .groupby(["K_UNICO","_YM"], observed=True, sort=False)
-          .cumcount()
+        df.sort_values(["Código único","_YM","_FechaDT"]).groupby(["Código único","_YM"]).cumcount()
     )
+    # visible
     df["Conteo Mensual"] = (order_in_month == 0).astype(int)
 
-    df_pieces = df[df["Tarifa × Superficie"] != 0].sort_values(["K_UNICO","_FechaDT"])
-    per_code_first = df_pieces.groupby("K_UNICO", observed=True, sort=False)["Tarifa × Superficie"].first()
-    per_code_count = df_pieces.groupby("K_UNICO", observed=True, sort=False)["Tarifa × Superficie"].size()
+    # Inversión: primera TxS por Código único / nº de piezas del código (interna derivada)
+    df_pieces = df[df["Tarifa × Superficie"] != 0].sort_values(["Código único","_FechaDT"])
+    per_code_first = df_pieces.groupby("Código único")["Tarifa × Superficie"].first()
+    per_code_count = df_pieces.groupby("Código único")["Tarifa × Superficie"].size()
     per_code_value = (per_code_first / per_code_count).astype(float)
-    df["Tarifa × Superficie (1ra por Código único)"] = df["K_UNICO"].map(per_code_value)
+    df["Tarifa × Superficie (1ra por Código único)"] = df["Código único"].map(per_code_value)
 
-    # ====== Columnas "Excel" internas ======
+    # Columnas "Excel" (AB..AI y EXTRAE) — internas
     if "NombreBase" in df.columns:
         s_nb = df["NombreBase"].astype(str)
         df["NB_EXTRAE_6_7"] = s_nb.str.slice(5, 12)
@@ -357,42 +340,40 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     copy_or_empty("Orientación de Vía", "OrientacionVia_AH")
     copy_or_empty("Marca", "Marca_AI")
 
-    # ====== Conteos (optimizado) ======
+    # Conteos tipo CONTAR.SI.CONJUNTO — internas
     ab_ai_keys = ["Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
                   "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
+    for c in ab_ai_keys:
+        if c not in df.columns:
+            df[c] = ""
+    counts = df.groupby(ab_ai_keys, dropna=False).size().reset_index(name="Conteo_AB_AI")
+    df = df.merge(counts, on=ab_ai_keys, how="left")
+
     z_keys = ["NB_EXTRAE_6_7","Proveedor_AC","TipoElemento_AD","Distrito_AE",
               "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
+    for c in z_keys:
+        if c not in df.columns:
+            df[c] = ""
+    counts2 = df.groupby(z_keys, dropna=False).size().reset_index(name="Conteo_Z_AB_AI")
+    df = df.merge(counts2, on=z_keys, how="left")
 
-    _to_category(df, ab_ai_keys)
-    _to_category(df, z_keys)
-
-    counts = (
-        df.groupby(ab_ai_keys, dropna=False, observed=True, sort=False)
-          .size().reset_index(name="Conteo_AB_AI")
-    )
-    df = df.merge(counts, on=ab_ai_keys, how="left", copy=False)
-
-    counts2 = (
-        df.groupby(z_keys, dropna=False, observed=True, sort=False)
-          .size().reset_index(name="Conteo_Z_AB_AI")
-    )
-    df = df.merge(counts2, on=z_keys, how="left", copy=False)
-
+    # TarifaS/3 — interna de apoyo
     df["TarifaS_div3"] = tarifa_num / 3.0
-    df["TarifaS_div3_sobre_Conteo"] = df["TarifaS_div3"] / pd.to_numeric(df["Conteo_AB_AI"], errors="coerce").astype(float)
+    df["TarifaS_div3_sobre_Conteo"] = df["TarifaS_div3"] / df["Conteo_AB_AI"].astype(float)
 
+    # SUMAR.SI.CONJUNTO — interna
     sum_keys = ["NB_EXTRAE_6_7","Proveedor","Tipo Elemento","Distrito",
                 "Avenida","Nro Calle/Cuadra","Orientación de Vía","Marca"]
     for c in sum_keys:
         if c not in df.columns:
             df[c] = ""
-    _to_category(df, sum_keys)
     sums = (
-        df.groupby(sum_keys, dropna=False, observed=True, sort=False)["TarifaS_div3_sobre_Conteo"]
+        df.groupby(sum_keys, dropna=False)["TarifaS_div3_sobre_Conteo"]
           .sum().reset_index(name="Suma_AM_Z_AB_AI")
     )
-    df = df.merge(sums, on=sum_keys, how="left", copy=False)
+    df = df.merge(sums, on=sum_keys, how="left")
 
+    # Tope por Tipo — internas de apoyo
     tipo_to_base = {
         "BANDEROLA": 12000, "CLIP": 600, "MINIPOLAR": 1000, "PALETA": 600,
         "PANEL": 1825, "PANEL CARRETERO": 5000, "PANTALLA LED": 5400,
@@ -405,6 +386,7 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     an_val = pd.to_numeric(df["Suma_AM_Z_AB_AI"], errors="coerce")
     df["Suma_AM_Topada_Tipo"] = np.where(np.isnan(tope), an_val, np.minimum(an_val, tope))
 
+    # División AO/AK y Tarifa Real ($) — visible
     denom = pd.to_numeric(df["Conteo_Z_AB_AI"], errors="coerce")
     df["SumaTopada_div_ConteoZ"] = np.where(
         denom > 0,
@@ -417,15 +399,17 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
         df["SumaTopada_div_ConteoZ"] * 0.8
     )
 
-    # Limpiezas internas
+    # Limpiezas solicitadas globales (internas)
     df.drop(columns=["Tarifa × Superficie"], inplace=True, errors="ignore")
     if "Tarifa S/." in df.columns:
         df.drop(columns=["Tarifa S/."], inplace=True, errors="ignore")
 
+    # Orden de columnas (base al inicio)
     base = ["Fecha", "AÑO", "MES", "SEMANA"]
     tail = [
-        "K_UNICO","K_PIEZA","Denominador",
+        "Código único","Denominador",
         "Q versiones por elemento" if "Q versiones por elemento" in df.columns else None,
+        "Código +1 pieza",
         "+1 superficie",
         "Tarifa × Superficie (1ra por Código único)",
         "Semana en Mes por Código","Conteo Mensual",
@@ -546,10 +530,12 @@ def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
     header_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
     ws = writer.sheets[sheet_name]
 
+    # Altura fija por defecto (no auto-ajustar)
     ws.set_default_row(15)
     ws.set_row(0, 15)
     ws.set_row(1, 15)
 
+    # Datos como tabla
     start_row = len(header_df) + 2
     df = df.copy()
     df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
@@ -581,12 +567,15 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     factores = factores or load_monitor_factors()
     outview_factor = float(outview_factor if outview_factor is not None else load_outview_factor())
 
+    # MONITOR
     df_m = _read_monitor_txt(monitor_file)
     df_m = _aplicar_factores_monitor(df_m, factores)
 
+    # OUTVIEW (enriquecido)
     df_o_raw = _read_out_robusto(out_file)
     df_o = _transform_outview_enriquecido(df_o_raw, factor_outview=outview_factor) if not df_o_raw.empty else pd.DataFrame()
 
+    # CONSOLIDADO unificado SOLO si existen ambas fuentes
     if not df_m.empty and not df_o.empty:
         mon_u = _to_unified(df_m, _MONITOR_MAP)
         out_u = _to_unified(df_o, _OUT_MAP)
@@ -595,6 +584,7 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     else:
         df_c = pd.DataFrame()
 
+    # OutView para Excel/vista pública: ocultar internas, incluyendo “Semana en Mes por Código”
     internal_targets = {
         "código único","código +1 pieza","denominador",
         "tarifa × superficie","tarifa × superficie (1ra por código único)",
@@ -602,13 +592,13 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
         "nb_extrae_6_7","fecha_ab","proveedor_ac","tipoelemento_ad","distrito_ae",
         "avenida_af","nrocallecuadra_ag","orientacionvia_ah","marca_ai",
         "conteo_ab_ai","conteo_z_ab_ai","tarifas_div3","tarifas_div3_sobre_conteo",
-        "suma_am_z_ab_ai","topetipo_aq","suma_am_topada_tipo","sumatopada_div_conteoz",
-        "k_unico","k_pieza"
+        "suma_am_z_ab_ai","topetipo_aq","suma_am_topada_tipo","sumatopada_div_conteoz"
     }
     def _norm(s: str) -> str: return str(s).strip().casefold()
     drop_cols = [c for c in df_o.columns if _norm(c) in internal_targets]
     df_o_public = df_o.drop(columns=drop_cols, errors="ignore")
 
+    # Excel
     xlsx = BytesIO()
     with pd.ExcelWriter(
         xlsx,
@@ -631,13 +621,14 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
             )
             _write_sheet_with_header_and_table(w, sheet_name="OutView", df=df_o_public, header_rows=hdr_o)
 
-        if not df_c.empty:
+        if not df_c.empty:  # solo si hay ambas
             d1, d2 = _date_range(df_c, ["FECHA"])
             hdr_c = [("Filas", len(df_c)),
                      ("Rango de fechas", f"{d1} - {d2}" if d1 and d2 else ""),
                      ("Fuentes incluidas", "Monitor + OutView")]
             _write_sheet_with_header_and_table(w, sheet_name="Consolidado", df=df_c, header_rows=hdr_c)
 
+        # Ajuste visual global
         wb = w.book
         fmt = wb.add_format({"valign": "vcenter"})
         for sh in ("Monitor", "OutView", "Consolidado"):
@@ -647,6 +638,7 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                 ws.set_column(1, 60, 18, fmt)
 
     xlsx.seek(0)
+    # Resultado principal para vista previa:
     if not df_c.empty:
         df_result = df_c
     elif not df_m.empty:
@@ -682,6 +674,7 @@ def _xlsx_to_csv_stream(xlsx_path: Path, csv_writer: csv.writer) -> None:
     try:
         from openpyxl import load_workbook
     except Exception:
+        # Fallback: intenta con pandas (puede usar más memoria)
         df = pd.read_excel(xlsx_path, engine="openpyxl")
         for i, row in enumerate(df.itertuples(index=False, name=None)):
             if i == 0:
@@ -694,6 +687,7 @@ def _xlsx_to_csv_stream(xlsx_path: Path, csv_writer: csv.writer) -> None:
     first = True
     for r in ws.iter_rows(values_only=True):
         if first:
+            # Si la primera fila aparenta ser cabecera
             headers = [str(x) if x is not None else "" for x in r]
             csv_writer.writerow(headers)
             first = False
@@ -724,6 +718,7 @@ def _combine_outview_to_csv(inputs: List[Path], out_csv: Path):
         for p in inputs:
             name = p.name.lower()
             if name.endswith(".csv"):
+                # Stream de CSV en chunks, saltando cabeceras repetidas
                 with p.open("r", encoding="utf-8", errors="ignore", newline="") as f_in:
                     reader = csv.reader(f_in)
                     for i, row in enumerate(reader):
@@ -733,7 +728,9 @@ def _combine_outview_to_csv(inputs: List[Path], out_csv: Path):
                             wrote_header = True
                         writer.writerow(row)
             else:
+                # XLSX -> CSV por streaming
                 if not wrote_header:
+                    # _xlsx_to_csv_stream se encargará de escribir cabecera
                     pass
                 _xlsx_to_csv_stream(p, writer)
                 wrote_header = True
@@ -748,6 +745,7 @@ def worker_run(args):
         total_steps = 6
         _progress(progress, "running", 0, total_steps, "Inicializando…")
 
+        # Combinar entradas
         mon_inputs = [Path(x) for x in (args.monitor or []) if x]
         out_inputs = [Path(x) for x in (args.outview or []) if x]
         job_dir = Path(args.job_dir) if args.job_dir else outxlsx.parent
@@ -767,10 +765,12 @@ def worker_run(args):
             _log_append(logf, f"OutView combinado en {comb_out}")
         step += 1
 
+        # Procesar con la misma lógica de UI
         _progress(progress, "running", step, total_steps, "Procesando cálculos…")
         factores = json.loads(args.factores_json) if args.factores_json else load_monitor_factors()
         out_factor = float(args.outview_factor) if args.outview_factor else load_outview_factor()
 
+        # Abrir handles
         mon_fh = open(comb_mon, "rb") if comb_mon and comb_mon.exists() else None
         out_fh = open(comb_out, "rb") if comb_out and comb_out.exists() else None
 
@@ -793,6 +793,7 @@ def worker_run(args):
         _progress(progress, "done", step, total_steps, "Completado")
         _log_append(logf, f"Éxito: {outxlsx}")
 
+        # Limpieza ligera
         gc.collect()
 
     except Exception as e:
@@ -817,10 +818,10 @@ if __name__ == "__main__":
     if args.as_worker:
         worker_run(args)
     else:
+        # Uso simple manual (debug): lee los primeros paths si existen
         mon = open(args.monitor[0], "rb") if args.monitor else None
         out = open(args.outview[0], "rb") if args.outview else None
         df, x = procesar_monitor_outview(mon, out, factores=None, outview_factor=None)
         print(df.head(3))
         if args.out_xlsx:
             Path(args.out_xlsx).write_bytes(x.getvalue())
-
