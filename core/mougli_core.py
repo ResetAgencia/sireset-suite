@@ -1,15 +1,8 @@
-# core/mougli_core.py
-# Mougli core + Worker CLI robusto (compatible Python 3.8/3.9)
+# core/mougli_core.py — versión compatible (Python 3.8/3.9), sin sintaxis moderna
 from __future__ import annotations
 
 import io
-import os
-import sys
 import json
-import csv
-import gc
-import argparse
-import traceback
 from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -21,7 +14,9 @@ import pandas as pd
 APP_DIR = Path(__file__).parent
 CONFIG_PATH = APP_DIR / "factores_config.json"
 
-_DEFAULT_MONITOR = {"TV": 0.255, "CABLE": 0.425, "RADIO": 0.425, "REVISTA": 0.14875, "DIARIOS": 0.14875}
+_DEFAULT_MONITOR = {
+    "TV": 0.255, "CABLE": 0.425, "RADIO": 0.425, "REVISTA": 0.14875, "DIARIOS": 0.14875
+}
 _DEFAULT_OUTVIEW = {"tarifa_superficie_factor": 1.25}
 
 
@@ -118,7 +113,9 @@ def _read_monitor_txt(file) -> pd.DataFrame:
     if "DIA" in df.columns:
         df["DIA"] = pd.to_datetime(df["DIA"], format="%d/%m/%Y", errors="coerce").dt.normalize()
         df["AÑO"] = df["DIA"].dt.year
-        df["MES"] = df["DIA"].dt.month.apply(lambda m: MESES_ES[int(m)] if pd.notnull(m) and 1 <= m <= 12 else "")
+        df["MES"] = df["DIA"].dt.month.apply(
+            lambda m: MESES_ES[int(m)] if pd.notnull(m) and 1 <= m <= 12 else ""
+        )
         df["SEMANA"] = df["DIA"].dt.isocalendar().week
 
     if "MEDIO" in df.columns:
@@ -193,7 +190,9 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     # Normalización de fechas
     df["Fecha"] = pd.to_datetime(df.get("Fecha"), dayfirst=True, errors="coerce")
     df["AÑO"] = df["Fecha"].dt.year
-    df["MES"] = df["Fecha"].dt.month.apply(lambda m: MESES_ES[int(m)] if pd.notnull(m) and 1 <= m <= 12 else "")
+    df["MES"] = df["Fecha"].dt.month.apply(
+        lambda m: MESES_ES[int(m)] if pd.notnull(m) and 1 <= m <= 12 else ""
+    )
     df["SEMANA"] = df["Fecha"].dt.isocalendar().week
     df["_FechaDT"] = df["Fecha"]
     df["_YM"] = df["_FechaDT"].dt.to_period("M")
@@ -306,8 +305,7 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     tope = tipo_up.map(tipo_to_base).astype(float) * (4.0/3.0)
     df["TopeTipo_AQ"] = tope
     an_val = pd.to_numeric(df["Suma_AM_Z_AB_AI"], errors="coerce")
-    # Si tope es todo NaN, dejamos an_val tal cual
-    df["Suma_AM_Topada_Tipo"] = np.where(np.isnan(tope), an_val, np.minimum(an_val, tope))
+    df["Suma_AM_Topada_Tipo"] = np.minimum(an_val, tope.where(~np.isnan(tope), an_val))
 
     denom = pd.to_numeric(df["Conteo_Z_AB_AI"], errors="coerce")
     df["SumaTopada_div_ConteoZ"] = np.where(
@@ -430,8 +428,9 @@ def _header_rows_for(df: pd.DataFrame, *,
     filas = [("Filas", len(df))]
     if fecha_col and fecha_col in df.columns and not df.empty:
         fmin, fmax = df[fecha_col].min(), df[fecha_col].max()
-        val = (f"{pd.to_datetime(fmin, errors='coerce'):%d/%m/%Y} - "
-               f"{pd.to_datetime(fmax, errors='coerce'):%d/%m/%Y}") if pd.notna(fmin) else "—"
+        vmin = pd.to_datetime(fmin, errors="coerce")
+        vmax = pd.to_datetime(fmax, errors="coerce")
+        val = (vmin.strftime("%d/%m/%Y") + " - " + vmax.strftime("%d/%m/%Y")) if pd.notna(vmin) else "—"
         filas.append(("Rango de fechas", val))
     if marca_col and marca_col in df.columns:
         filas.append(("Marcas / Anunciantes", df[marca_col].dropna().nunique()))
@@ -474,20 +473,29 @@ def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
     ws.set_column(0, max(0, ncol - 1), 18)
 
 
-# ───────────────────────── Función principal (UI directa) ─────────────────────
+# ───────────────────────── Función principal ─────────────────────────
 def procesar_monitor_outview(monitor_file,
                              out_file,
                              factores: Optional[Dict[str, float]],
                              outview_factor: Optional[float] = None):
+    """
+    Devuelve (df_result, xlsx_bytes) con hojas condicionales.
+    Se eliminan en Excel/Vista previa TODAS las columnas internas, incluyendo:
+    - 'Semana en Mes por Código'
+    """
     factores = factores or load_monitor_factors()
     outview_factor = float(outview_factor if outview_factor is not None else load_outview_factor())
 
+    # MONITOR
     df_m = _read_monitor_txt(monitor_file)
     df_m = _aplicar_factores_monitor(df_m, factores)
 
+    # OUTVIEW (enriquecido)
     df_o_raw = _read_out_robusto(out_file)
-    df_o = _transform_outview_enriquecido(df_o_raw, factor_outview=outview_factor) if not df_o_raw.empty else pd.DataFrame()
+    df_o = _transform_outview_enriquecido(df_o_raw, factor_outview=outview_factor) \
+        if not df_o_raw.empty else pd.DataFrame()
 
+    # CONSOLIDADO unificado solo si existen ambas fuentes
     if not df_m.empty and not df_o.empty:
         mon_u = _to_unified(df_m, _MONITOR_MAP)
         out_u = _to_unified(df_o, _OUT_MAP)
@@ -496,20 +504,22 @@ def procesar_monitor_outview(monitor_file,
     else:
         df_c = pd.DataFrame()
 
-    # Ocultar internas (incluye “Semana en Mes por Código”) en Excel y preview
+    # ===== OutView: eliminar columnas internas (también "Semana en Mes por Código") =====
     internal_targets = {
-        "código único","código +1 pieza","denominador",
-        "tarifa × superficie","tarifa × superficie (1ra por código único)",
-        "semana en mes por código",
+        "código único", "código +1 pieza", "denominador",
+        "tarifa × superficie", "tarifa × superficie (1ra por código único)",
+        "semana en mes por código",  # <- removida
         "nb_extrae_6_7","fecha_ab","proveedor_ac","tipoelemento_ad","distrito_ae",
         "avenida_af","nrocallecuadra_ag","orientacionvia_ah","marca_ai",
         "conteo_ab_ai","conteo_z_ab_ai","tarifas_div3","tarifas_div3_sobre_conteo",
         "suma_am_z_ab_ai","topetipo_aq","suma_am_topada_tipo","sumatopada_div_conteoz"
     }
-    def _norm(s: str) -> str: return str(s).strip().casefold()
+    def _norm(s: str) -> str:
+        return str(s).strip().casefold()
     drop_cols = [c for c in df_o.columns if _norm(c) in internal_targets]
     df_o_public = df_o.drop(columns=drop_cols, errors="ignore")
 
+    # Excel
     xlsx = BytesIO()
     with pd.ExcelWriter(xlsx, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
         if not df_m.empty:
@@ -549,169 +559,3 @@ def procesar_monitor_outview(monitor_file,
     else:
         df_result = df_o_public
     return df_result, xlsx
-
-
-# ───────────────────────────── Worker CLI (background) ────────────────────────
-def _json_atomic_write(path: Path, payload: dict):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
-
-
-def _log_append(log_path: Path, msg: str):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(msg.rstrip() + "\n")
-
-
-def _progress(progress_path: Path, status: str, step: int, total: int, message: str):
-    _json_atomic_write(progress_path, {
-        "status": status, "step": step, "total": total,
-        "message": message, "pid": os.getpid()
-    })
-
-
-def _xlsx_to_csv_stream(xlsx_path: Path, csv_writer: csv.writer) -> None:
-    """Convierte la PRIMERA hoja a CSV por streaming (sin cargar todo en memoria)."""
-    try:
-        from openpyxl import load_workbook
-    except Exception:
-        df = pd.read_excel(xlsx_path, engine="openpyxl")
-        for i, row in enumerate(df.itertuples(index=False, name=None)):
-            if i == 0:
-                csv_writer.writerow(list(df.columns))
-            csv_writer.writerow(list(row))
-        return
-
-    wb = load_workbook(filename=str(xlsx_path), read_only=True, data_only=True)
-    ws = wb.active
-    first = True
-    for r in ws.iter_rows(values_only=True):
-        if first:
-            headers = [str(x) if x is not None else "" for x in r]
-            csv_writer.writerow(headers)
-            first = False
-        else:
-            csv_writer.writerow(["" if x is None else x for x in r])
-    try:
-        wb.close()
-    except Exception:
-        pass
-
-
-def _combine_monitor_txt(inputs: List[Path], out_txt: Path):
-    out_txt.parent.mkdir(parents=True, exist_ok=True)
-    with out_txt.open("wb") as w:
-        for i, p in enumerate(inputs):
-            with p.open("rb") as r:
-                if i > 0:
-                    w.write(b"\n")
-                for chunk in iter(lambda: r.read(1024 * 1024), b""):
-                    w.write(chunk)
-
-
-def _combine_outview_to_csv(inputs: List[Path], out_csv: Path):
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with out_csv.open("w", newline="", encoding="utf-8") as f_out:
-        writer = csv.writer(f_out)
-        wrote_header = False
-        for p in inputs:
-            name = p.name.lower()
-            if name.endswith(".csv"):
-                with p.open("r", encoding="utf-8", errors="ignore", newline="") as f_in:
-                    reader = csv.reader(f_in)
-                    for i, row in enumerate(reader):
-                        if i == 0:
-                            if wrote_header:
-                                continue
-                            wrote_header = True
-                        writer.writerow(row)
-            else:
-                _xlsx_to_csv_stream(p, writer)
-                wrote_header = True
-
-
-def worker_run(args):
-    progress = Path(args.progress)
-    logf = Path(args.log)
-    outxlsx = Path(args.out_xlsx)
-
-    try:
-        total_steps = 6
-        _progress(progress, "running", 0, total_steps, "Inicializando…")
-
-        mon_inputs = [Path(x) for x in (args.monitor or []) if x]
-        out_inputs = [Path(x) for x in (args.outview or []) if x]
-        job_dir = Path(args.job_dir) if args.job_dir else outxlsx.parent
-
-        comb_mon = job_dir / "combined_monitor.txt" if mon_inputs else None
-        comb_out = job_dir / "combined_outview.csv" if out_inputs else None
-
-        step = 1
-        if mon_inputs:
-            _progress(progress, "running", step, total_steps, "Combinando Monitor…")
-            _combine_monitor_txt(mon_inputs, comb_mon)
-            _log_append(logf, f"Monitor combinado en {comb_mon}")
-        step += 1
-        if out_inputs:
-            _progress(progress, "running", step, total_steps, "Combinando OutView…")
-            _combine_outview_to_csv(out_inputs, comb_out)
-            _log_append(logf, f"OutView combinado en {comb_out}")
-        step += 1
-
-        _progress(progress, "running", step, total_steps, "Procesando cálculos…")
-        factores = json.loads(args.factores_json) if args.factores_json else load_monitor_factors()
-        out_factor = float(args.outview_factor) if args.outview_factor else load_outview_factor()
-
-        mon_fh = open(comb_mon, "rb") if comb_mon and comb_mon.exists() else None
-        out_fh = open(comb_out, "rb") if comb_out and comb_out.exists() else None
-
-        try:
-            df_result, xbytes = procesar_monitor_outview(mon_fh, out_fh, factores=factores, outview_factor=out_factor)
-        finally:
-            for fh in (mon_fh, out_fh):
-                try:
-                    if fh: fh.close()
-                except Exception:
-                    pass
-
-        step += 1
-        _progress(progress, "running", step, total_steps, "Generando Excel…")
-        outxlsx.parent.mkdir(parents=True, exist_ok=True)
-        with outxlsx.open("wb") as w:
-            w.write(xbytes.getvalue())
-
-        step += 1
-        _progress(progress, "done", step, total_steps, "Completado")
-        _log_append(logf, f"Éxito: {outxlsx}")
-
-        gc.collect()
-
-    except Exception as e:
-        _log_append(logf, "ERROR:\n" + "".join(traceback.format_exception(e)))
-        _progress(progress, "error", 1, 1, f"{type(e).__name__}: {e}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Mougli worker/CLI")
-    parser.add_argument("--as-worker", action="store_true", help="Ejecutar en modo worker")
-    parser.add_argument("--monitor", action="append", default=[], help="Ruta(s) Monitor .txt")
-    parser.add_argument("--outview", action="append", default=[], help="Ruta(s) OutView .csv/.xlsx")
-    parser.add_argument("--out-xlsx", required=False)
-    parser.add_argument("--progress", required=False)
-    parser.add_argument("--log", required=False)
-    parser.add_argument("--job-dir", required=False)
-    parser.add_argument("--factores-json", default="")
-    parser.add_argument("--outview-factor", default="")
-    args = parser.parse_args()
-
-    if args.as-worker:
-        worker_run(args)
-    else:
-        mon = open(args.monitor[0], "rb") if args.monitor else None
-        out = open(args.outview[0], "rb") if args.outview else None
-        df, x = procesar_monitor_outview(mon, out, factores=None, outview_factor=None)
-        print(df.head(3))
-        if args.out_xlsx:
-            Path(args.out_xlsx).write_bytes(x.getvalue())
