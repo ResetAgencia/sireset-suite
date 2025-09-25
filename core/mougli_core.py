@@ -133,26 +133,97 @@ def _read_monitor_txt(file) -> pd.DataFrame:
 
 
 def _read_out_robusto(file) -> pd.DataFrame:
+    """
+    Lector robusto y liviano de OutView:
+    - Carga solo columnas necesarias (reduce RAM).
+    - Corrige formatos numéricos de 'Tarifa S/.' (punto de miles/coma decimal).
+    - Usa openpyxl en modo read_only para XLSX grandes.
+    """
     if file is None:
         return pd.DataFrame()
+
+    REQUIRED = {
+        "Fecha","Latitud","Longitud","Avenida","Nro Calle/Cuadra","Marca","Tipo Elemento",
+        "Orientación de Vía","Tarifa S/.","Proveedor","Distrito","Cod.Proveedor","NombreBase",
+        "Item","Versión","Categoría","Anunciante","Sector","Región","Producto","Agencia"
+    }
+    usecols_cb = lambda c: str(c).strip() in REQUIRED
+
     name = (getattr(file, "name", "") or "").lower()
+
+    def _fix_tarifa(df: pd.DataFrame) -> pd.DataFrame:
+        if "Tarifa S/." in df.columns:
+            s = df["Tarifa S/."].astype(str).str.strip()
+            # quita punto de miles: 180.498 -> 180498
+            s = s.str.replace(r"(?<=\d)\.(?=\d{3}(\D|$))", "", regex=True)
+            # coma decimal -> punto
+            s = s.str.replace(",", ".", regex=False)
+            df["Tarifa S/."] = pd.to_numeric(s, errors="coerce")
+        return df
+
     try:
         if name.endswith(".csv"):
+            engine = None
+            try:
+                import pyarrow  # noqa: F401
+                engine = "pyarrow"
+            except Exception:
+                engine = None
+
             try:
                 file.seek(0)
-                return pd.read_csv(file, low_memory=False)
-            except UnicodeDecodeError:
+            except Exception:
+                pass
+
+            df = pd.read_csv(
+                file,
+                usecols=usecols_cb,
+                engine=engine,
+                low_memory=False,
+                dtype_backend="pyarrow" if engine == "pyarrow" else "numpy"
+            )
+            return _fix_tarifa(df)
+
+        # XLSX read_only
+        try:
+            try:
                 file.seek(0)
-                return pd.read_csv(file, sep=";", encoding="latin-1", low_memory=False)
-        file.seek(0)
-        return pd.read_excel(file, engine="openpyxl")
+            except Exception:
+                pass
+            from openpyxl import load_workbook
+            wb = load_workbook(filename=file, read_only=True, data_only=True)
+            ws = wb.active
+            headers = None
+            rows = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i == 0:
+                    headers = [str(x) if x is not None else "" for x in row]
+                    keep_idx = [j for j, h in enumerate(headers) if h.strip() in REQUIRED]
+                else:
+                    if not row:
+                        continue
+                    rows.append([row[j] for j in keep_idx])
+            try:
+                wb.close()
+            except Exception:
+                pass
+            if not rows:
+                return pd.DataFrame(columns=REQUIRED)
+            df = pd.DataFrame(rows, columns=[headers[j] for j in keep_idx])
+            return _fix_tarifa(df)
+        except Exception:
+            file.seek(0)
+            df = pd.read_excel(file, usecols=usecols_cb, engine="openpyxl")
+            return _fix_tarifa(df)
     except Exception:
         try:
             file.seek(0)
-            return pd.read_csv(file, sep=";", encoding="latin-1", low_memory=False)
+            df = pd.read_csv(file, sep=";", usecols=usecols_cb, encoding="latin-1", low_memory=False)
+            return _fix_tarifa(df)
         except Exception:
             file.seek(0)
-            return pd.read_excel(file, engine="openpyxl")
+            df = pd.read_excel(file, usecols=usecols_cb, engine="openpyxl")
+            return _fix_tarifa(df)
 
 
 # ───────────────────────── Transformaciones ─────────────────────────
@@ -517,7 +588,7 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     internal_targets = {
         "código único","código +1 pieza","denominador",
         "tarifa × superficie","tarifa × superficie (1ra por código único)",
-        "semana en mes por código",  # <- se elimina explícitamente
+        "semana en mes por código",
         "nb_extrae_6_7","fecha_ab","proveedor_ac","tipoelemento_ad","distrito_ae",
         "avenida_af","nrocallecuadra_ag","orientacionvia_ah","marca_ai",
         "conteo_ab_ai","conteo_z_ab_ai","tarifas_div3","tarifas_div3_sobre_conteo",
@@ -529,7 +600,13 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
 
     # Excel
     xlsx = BytesIO()
-    with pd.ExcelWriter(xlsx, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
+    with pd.ExcelWriter(
+        xlsx,
+        engine="xlsxwriter",
+        datetime_format="dd/mm/yyyy",
+        date_format="dd/mm/yyyy",
+        engine_kwargs={"options": {"constant_memory": True, "strings_to_urls": False}}
+    ) as w:
         if not df_m.empty:
             hdr_m = _header_rows_for(
                 df_m, fecha_col="DIA", marca_col="MARCA",
