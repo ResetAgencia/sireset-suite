@@ -518,7 +518,6 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
         df_c = pd.DataFrame()
 
     # ===== OutView: eliminar columnas internas (no deben aparecer en Excel ni en vista previa) =====
-    # Mantener VISIBLES: "Conteo Mensual", "Q versiones por elemento", "Tarifa Real ($)", "+1 superficie"
     internal_targets = {
         "código único", "código +1 pieza", "denominador",
         "tarifa × superficie", "tarifa × superficie (1ra por código único)",
@@ -535,14 +534,13 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     drop_cols = [c for c in df_o.columns if _norm(c) in internal_targets]
     df_o_public = df_o.drop(columns=drop_cols, errors="ignore")
 
-    # Excel con memoria constante
+    # Excel (SIN engine_kwargs para compatibilidad amplia)
     xlsx = BytesIO()
     with pd.ExcelWriter(
         xlsx,
         engine="xlsxwriter",
         datetime_format="dd/mm/yyyy",
         date_format="dd/mm/yyyy",
-        engine_kwargs={"options": {"constant_memory": True, "strings_to_formulas": False}},
     ) as w:
         if not df_m.empty:
             hdr_m = _header_rows_for(
