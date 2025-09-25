@@ -181,6 +181,16 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
         return pd.DataFrame()
 
     df = df.copy()
+
+    # Compactar dtypes para ahorrar RAM
+    for c in ["Proveedor","Tipo Elemento","Distrito","Avenida","Nro Calle/Cuadra",
+              "Orientación de Vía","Marca","Anunciante","Categoría","Medio","Item","NombreBase"]:
+        if c in df.columns:
+            df[c] = df[c].astype("category")
+    for c in ["Latitud","Longitud","Tarifa S/."]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
+
     # Normalización de fechas
     df["Fecha"] = pd.to_datetime(df.get("Fecha"), dayfirst=True, errors="coerce")
     df["AÑO"] = df["Fecha"].dt.year
@@ -212,7 +222,6 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     # Métricas base
     df["Denominador"] = df.groupby("Código único")["Código único"].transform("size")
     if ver_col:
-        # nombre visible
         df["Q versiones por elemento"] = df.groupby("Código único")[ver_col].transform("nunique")
 
     # visible (minúscula exacta pedida)
@@ -231,7 +240,6 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     order_in_month = (
         df.sort_values(["Código único","_YM","_FechaDT"]).groupby(["Código único","_YM"]).cumcount()
     )
-    # visible
     df["Conteo Mensual"] = (order_in_month == 0).astype(int)
 
     # Inversión: primera TxS por Código único / nº de piezas del código (interna derivada)
@@ -260,38 +268,26 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     copy_or_empty("Orientación de Vía", "OrientacionVia_AH")
     copy_or_empty("Marca", "Marca_AI")
 
-    # Conteos tipo CONTAR.SI.CONJUNTO — internas
-    ab_ai_keys = ["Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
-                  "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
-    for c in ab_ai_keys:
-        if c not in df.columns:
-            df[c] = ""
-    counts = df.groupby(ab_ai_keys, dropna=False).size().reset_index(name="Conteo_AB_AI")
-    df = df.merge(counts, on=ab_ai_keys, how="left")
+    # ── Conteos y sumas SIN merges (solo transform) para ahorrar RAM ──
+    df["Conteo_AB_AI"] = df.groupby(
+        ["Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
+         "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
+    )["Fecha_AB"].transform("size")
 
-    z_keys = ["NB_EXTRAE_6_7","Proveedor_AC","TipoElemento_AD","Distrito_AE",
-              "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
-    for c in z_keys:
-        if c not in df.columns:
-            df[c] = ""
-    counts2 = df.groupby(z_keys, dropna=False).size().reset_index(name="Conteo_Z_AB_AI")
-    df = df.merge(counts2, on=z_keys, how="left")
+    df["Conteo_Z_AB_AI"] = df.groupby(
+        ["NB_EXTRAE_6_7","Proveedor_AC","TipoElemento_AD","Distrito_AE",
+         "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
+    )["NB_EXTRAE_6_7"].transform("size")
 
     # TarifaS/3 — interna de apoyo
     df["TarifaS_div3"] = tarifa_num / 3.0
     df["TarifaS_div3_sobre_Conteo"] = df["TarifaS_div3"] / df["Conteo_AB_AI"].astype(float)
 
-    # SUMAR.SI.CONJUNTO — interna
-    sum_keys = ["NB_EXTRAE_6_7","Proveedor","Tipo Elemento","Distrito",
-                "Avenida","Nro Calle/Cuadra","Orientación de Vía","Marca"]
-    for c in sum_keys:
-        if c not in df.columns:
-            df[c] = ""
-    sums = (
-        df.groupby(sum_keys, dropna=False)["TarifaS_div3_sobre_Conteo"]
-          .sum().reset_index(name="Suma_AM_Z_AB_AI")
-    )
-    df = df.merge(sums, on=sum_keys, how="left")
+    # SUMAR.SI.CONJUNTO equivalente con transform
+    df["Suma_AM_Z_AB_AI"] = df.groupby(
+        ["NB_EXTRAE_6_7","Proveedor","Tipo Elemento","Distrito",
+         "Avenida","Nro Calle/Cuadra","Orientación de Vía","Marca"]
+    )["TarifaS_div3_sobre_Conteo"].transform("sum")
 
     # Tope por Tipo — internas de apoyo
     tipo_to_base = {
@@ -446,31 +442,48 @@ def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
                                        sheet_name: str,
                                        df: pd.DataFrame,
                                        header_rows: List[Tuple[str, str]]):
+    """Escritura segura: memoria constante, chunks y sin add_table en tablas enormes."""
     header_df = pd.DataFrame(header_rows, columns=["Descripción", "Valor"])
     header_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
     ws = writer.sheets[sheet_name]
 
-    # Altura fija por defecto (no auto-ajustar)
     ws.set_default_row(15)
     ws.set_row(0, 15)
     ws.set_row(1, 15)
 
-    # Datos como tabla
     start_row = len(header_df) + 2
-    df = df.copy()
-    df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
+
+    # límites “seguros”
+    ADD_TABLE_MAX = 50_000
+    CHUNK_ROWS = 200_000
 
     nrow, ncol = df.shape
-    start_col_letter = "A"
-    end_col_letter = _col_letter(ncol - 1)
-    rng = f"{start_col_letter}{start_row+1}:{end_col_letter}{start_row + max(nrow,1) + 1}"
 
-    ws.add_table(rng, {
-        "name": f"{sheet_name.replace(' ', '_')}_tbl",
-        "header_row": True,
-        "style": "Table Style Medium 9",
-        "columns": [{"header": str(h)} for h in df.columns]
-    })
+    if nrow > CHUNK_ROWS:
+        # Escritura por trozos, sin add_table
+        r = start_row
+        first = True
+        for i in range(0, nrow, CHUNK_ROWS):
+            chunk = df.iloc[i:i + CHUNK_ROWS]
+            chunk.to_excel(writer, sheet_name=sheet_name, index=False, startrow=r, header=first)
+            r += len(chunk) + (1 if first else 0)
+            first = False
+    else:
+        # Escritura estándar
+        df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
+
+        # add_table solo si no es enorme
+        if nrow <= ADD_TABLE_MAX:
+            start_col_letter = "A"
+            end_col_letter = _col_letter(ncol - 1)
+            rng = f"{start_col_letter}{start_row+1}:{end_col_letter}{start_row + max(nrow,1) + 1}"
+            ws.add_table(rng, {
+                "name": f"{sheet_name.replace(' ', '_')}_tbl",
+                "header_row": True,
+                "style": "Table Style Medium 9",
+                "columns": [{"header": str(h)} for h in df.columns]
+            })
+
     ws.freeze_panes(start_row + 1, 0)
     ws.set_column(0, max(0, ncol - 1), 18)
 
@@ -509,7 +522,7 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     internal_targets = {
         "código único", "código +1 pieza", "denominador",
         "tarifa × superficie", "tarifa × superficie (1ra por código único)",
-        "semana en mes por código",  # <- clave: esta queda eliminada aquí
+        "semana en mes por código",
         "nb_extrae_6_7", "fecha_ab", "proveedor_ac", "tipoelemento_ad", "distrito_ae",
         "avenida_af", "nrocallecuadra_ag", "orientacionvia_ah", "marca_ai",
         "conteo_ab_ai", "conteo_z_ab_ai", "tarifas_div3", "tarifas_div3_sobre_conteo",
@@ -519,13 +532,18 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     def _norm(s: str) -> str:
         return str(s).strip().casefold()
 
-    # Construir lista de columnas a eliminar por coincidencia normalizada
     drop_cols = [c for c in df_o.columns if _norm(c) in internal_targets]
     df_o_public = df_o.drop(columns=drop_cols, errors="ignore")
 
-    # Excel
+    # Excel con memoria constante
     xlsx = BytesIO()
-    with pd.ExcelWriter(xlsx, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
+    with pd.ExcelWriter(
+        xlsx,
+        engine="xlsxwriter",
+        datetime_format="dd/mm/yyyy",
+        date_format="dd/mm/yyyy",
+        engine_kwargs={"options": {"constant_memory": True, "strings_to_formulas": False}},
+    ) as w:
         if not df_m.empty:
             hdr_m = _header_rows_for(
                 df_m, fecha_col="DIA", marca_col="MARCA",
@@ -538,7 +556,6 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                 df_o, fecha_col="Fecha", marca_col="Anunciante",
                 extras=[("Tipo Elemento","Tipo"), ("Proveedor","Proveedor"), ("Región","Regiones")]
             )
-            # Escribimos la versión "pública" sin columnas internas:
             _write_sheet_with_header_and_table(w, sheet_name="OutView", df=df_o_public, header_rows=hdr_o)
 
         if not df_c.empty:  # solo si hay ambas
@@ -558,12 +575,12 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                 ws.set_column(1, 60, 18, fmt)
 
     xlsx.seek(0)
+
     # Resultado principal para vista previa:
     if not df_c.empty:
         df_result = df_c
     elif not df_m.empty:
         df_result = df_m
     else:
-        # Si solo hay OutView, muestra versión pública (sin internas) en la vista previa
         df_result = df_o_public
     return df_result, xlsx
