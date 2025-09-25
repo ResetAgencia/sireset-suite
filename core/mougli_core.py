@@ -1,9 +1,17 @@
 # core/mougli_core.py
+# ──────────────────────────────────────────────────────────────────────────────
+# Motor Mougli + Worker de procesamiento seguro (subproceso + logs + fallbacks)
+# ──────────────────────────────────────────────────────────────────────────────
 import io
+import os
+import sys
 import json
+import time
+import argparse
+import traceback
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -12,10 +20,18 @@ import pandas as pd
 APP_DIR = Path(__file__).parent
 CONFIG_PATH = APP_DIR / "factores_config.json"
 
-_DEFAULT_MONITOR = {"TV": 0.255, "CABLE": 0.425, "RADIO": 0.425, "REVISTA": 0.14875, "DIARIOS": 0.14875}
+_DEFAULT_MONITOR = {
+    "TV": 0.255, "CABLE": 0.425, "RADIO": 0.425, "REVISTA": 0.14875, "DIARIOS": 0.14875
+}
 _DEFAULT_OUTVIEW = {"tarifa_superficie_factor": 1.25}
 
+# Umbrales “seguros”
+SAFE_MAX_PREVIEW_ROWS = 100_000          # para vista previa (evita reventar RAM)
+SAFE_DISABLE_TABLE_AT_ROWS = 120_000     # en Excel, no crea tabla si supera esto
+SAFE_BIG_EXPORT_FALLBACK = True          # si falla Excel -> ZIP CSV
 
+
+# ───────────────────────── Config y factores (persistentes) ───────────────────
 def _load_cfg() -> dict:
     if CONFIG_PATH.exists():
         try:
@@ -27,7 +43,10 @@ def _load_cfg() -> dict:
         except Exception:
             pass
     cfg = {"monitor": _DEFAULT_MONITOR.copy(), "outview": _DEFAULT_OUTVIEW.copy()}
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        pass
     return cfg
 
 
@@ -168,7 +187,7 @@ def _aplicar_factores_monitor(df: pd.DataFrame, factores: Dict[str, float]) -> p
     return df
 
 
-def _version_column(df: pd.DataFrame) -> str | None:
+def _version_column(df: pd.DataFrame) -> Optional[str]:
     for c in df.columns:
         if str(c).lower().startswith("vers"):
             return c
@@ -181,16 +200,6 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
         return pd.DataFrame()
 
     df = df.copy()
-
-    # Compactar dtypes para ahorrar RAM
-    for c in ["Proveedor","Tipo Elemento","Distrito","Avenida","Nro Calle/Cuadra",
-              "Orientación de Vía","Marca","Anunciante","Categoría","Medio","Item","NombreBase"]:
-        if c in df.columns:
-            df[c] = df[c].astype("category")
-    for c in ["Latitud","Longitud","Tarifa S/."]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
-
     # Normalización de fechas
     df["Fecha"] = pd.to_datetime(df.get("Fecha"), dayfirst=True, errors="coerce")
     df["AÑO"] = df["Fecha"].dt.year
@@ -219,24 +228,19 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
         safe(r.get("AÑO","")), safe(r.get("SEMANA",""))
     ]), axis=1)
 
-    # Métricas base
+    # Métricas base (visibles)
     df["Denominador"] = df.groupby("Código único")["Código único"].transform("size")
     if ver_col:
         df["Q versiones por elemento"] = df.groupby("Código único")[ver_col].transform("nunique")
-
-    # visible (minúscula exacta pedida)
     df["+1 superficie"] = df.groupby("Código +1 pieza")["Código +1 pieza"].transform("size")
 
+    # Tarifa × Superficie (solo p/ cálculo interno) + factor cliente
     tarifa_num = pd.to_numeric(df.get("Tarifa S/."), errors="coerce").fillna(0)
     first_in_piece = (df.groupby("Código +1 pieza").cumcount() == 0)
-
-    # interna para cálculo
     df["Tarifa × Superficie"] = np.where(first_in_piece, tarifa_num * df["+1 superficie"], 0.0)
     df["Tarifa × Superficie"] = (df["Tarifa × Superficie"] * float(factor_outview)) / 3.8
 
-    df["Semana en Mes por Código"] = (
-        df.groupby(["Código único","_YM"])["_FechaDT"].transform(lambda s: s.rank(method="dense").astype(int))
-    )
+    # “Conteo Mensual” visible (1 si es primera aparición del código en el mes)
     order_in_month = (
         df.sort_values(["Código único","_YM","_FechaDT"]).groupby(["Código único","_YM"]).cumcount()
     )
@@ -249,7 +253,7 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     per_code_value = (per_code_first / per_code_count).astype(float)
     df["Tarifa × Superficie (1ra por Código único)"] = df["Código único"].map(per_code_value)
 
-    # Columnas "Excel" (AB..AI y EXTRAE) — internas
+    # Columnas “Excel” de apoyo (internas)
     if "NombreBase" in df.columns:
         s_nb = df["NombreBase"].astype(str)
         df["NB_EXTRAE_6_7"] = s_nb.str.slice(5, 12)
@@ -268,28 +272,40 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     copy_or_empty("Orientación de Vía", "OrientacionVia_AH")
     copy_or_empty("Marca", "Marca_AI")
 
-    # ── Conteos y sumas SIN merges (solo transform) para ahorrar RAM ──
-    df["Conteo_AB_AI"] = df.groupby(
-        ["Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
-         "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
-    )["Fecha_AB"].transform("size")
+    # Conteos internos
+    ab_ai_keys = ["Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
+                  "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
+    for c in ab_ai_keys:
+        if c not in df.columns:
+            df[c] = ""
+    counts = df.groupby(ab_ai_keys, dropna=False).size().reset_index(name="Conteo_AB_AI")
+    df = df.merge(counts, on=ab_ai_keys, how="left")
 
-    df["Conteo_Z_AB_AI"] = df.groupby(
-        ["NB_EXTRAE_6_7","Proveedor_AC","TipoElemento_AD","Distrito_AE",
-         "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
-    )["NB_EXTRAE_6_7"].transform("size")
+    z_keys = ["NB_EXTRAE_6_7","Proveedor_AC","TipoElemento_AD","Distrito_AE",
+              "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
+    for c in z_keys:
+        if c not in df.columns:
+            df[c] = ""
+    counts2 = df.groupby(z_keys, dropna=False).size().reset_index(name="Conteo_Z_AB_AI")
+    df = df.merge(counts2, on=z_keys, how="left")
 
-    # TarifaS/3 — interna de apoyo
+    # TarifaS/3 — interna
     df["TarifaS_div3"] = tarifa_num / 3.0
     df["TarifaS_div3_sobre_Conteo"] = df["TarifaS_div3"] / df["Conteo_AB_AI"].astype(float)
 
-    # SUMAR.SI.CONJUNTO equivalente con transform
-    df["Suma_AM_Z_AB_AI"] = df.groupby(
-        ["NB_EXTRAE_6_7","Proveedor","Tipo Elemento","Distrito",
-         "Avenida","Nro Calle/Cuadra","Orientación de Vía","Marca"]
-    )["TarifaS_div3_sobre_Conteo"].transform("sum")
+    # Sumas internas (SUMAR.SI.CONJUNTO)
+    sum_keys = ["NB_EXTRAE_6_7","Proveedor","Tipo Elemento","Distrito",
+                "Avenida","Nro Calle/Cuadra","Orientación de Vía","Marca"]
+    for c in sum_keys:
+        if c not in df.columns:
+            df[c] = ""
+    sums = (
+        df.groupby(sum_keys, dropna=False)["TarifaS_div3_sobre_Conteo"]
+          .sum().reset_index(name="Suma_AM_Z_AB_AI")
+    )
+    df = df.merge(sums, on=sum_keys, how="left")
 
-    # Tope por Tipo — internas de apoyo
+    # Tope por Tipo — internas
     tipo_to_base = {
         "BANDEROLA": 12000, "CLIP": 600, "MINIPOLAR": 1000, "PALETA": 600,
         "PANEL": 1825, "PANEL CARRETERO": 5000, "PANTALLA LED": 5400,
@@ -302,7 +318,7 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     an_val = pd.to_numeric(df["Suma_AM_Z_AB_AI"], errors="coerce")
     df["Suma_AM_Topada_Tipo"] = np.where(np.isnan(tope), an_val, np.minimum(an_val, tope))
 
-    # División AO/AK y Tarifa Real ($) — visible
+    # Tarifa Real ($) — visible
     denom = pd.to_numeric(df["Conteo_Z_AB_AI"], errors="coerce")
     df["SumaTopada_div_ConteoZ"] = np.where(
         denom > 0,
@@ -320,24 +336,25 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     if "Tarifa S/." in df.columns:
         df.drop(columns=["Tarifa S/."], inplace=True, errors="ignore")
 
-    # Orden de columnas (base al inicio)
+    # Orden de columnas
     base = ["Fecha", "AÑO", "MES", "SEMANA"]
     tail = [
         "Código único","Denominador",
         "Q versiones por elemento" if "Q versiones por elemento" in df.columns else None,
-        "Código +1 pieza",
-        "+1 superficie",
+        "Código +1 pieza","+1 superficie",
         "Tarifa × Superficie (1ra por Código único)",
-        "Semana en Mes por Código","Conteo Mensual",
+        # ⚠️ EXCLUIDA de salida: "Semana en Mes por Código"
+        "Conteo Mensual",
+        # internas ocultables:
         "NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
         "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI",
         "Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
-        "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo",
-        "SumaTopada_div_ConteoZ",
+        "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ",
+        # visible:
         "Tarifa Real ($)"
     ]
     tail = [c for c in tail if c]
-    cols = [*base] + [c for c in df.columns if c not in (*base, *tail, "_FechaDT", "_YM")] + tail
+    cols = [*base] + [c for c in df.columns if c not in (*base, *tail, "_FechaDT", "_YM", "Semana en Mes por Código")] + tail
     return df[cols].copy()
 
 
@@ -354,7 +371,7 @@ def _brands_count(df: pd.DataFrame, candidates: List[str]) -> int | None:
     return None
 
 
-def _date_range(df: pd.DataFrame, candidates: List[str]) -> Tuple[str, str] | Tuple[None, None]:
+def _date_range(df: pd.DataFrame, candidates: List[str]) -> Tuple[Optional[str], Optional[str]]:
     for c in candidates:
         if c in df.columns:
             s = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
@@ -420,7 +437,7 @@ def _to_unified(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
 
 
 # ───────────────────────── Excel (encabezado + tabla) ─────────────────────────
-def _header_rows_for(df: pd.DataFrame, *, fecha_col: str | None, marca_col: str | None,
+def _header_rows_for(df: pd.DataFrame, *, fecha_col: Optional[str], marca_col: Optional[str],
                      extras: List[Tuple[str, str]] | None = None) -> List[Tuple[str, str]]:
     filas = [("Filas", len(df))]
     if fecha_col and fecha_col in df.columns and not df.empty:
@@ -442,53 +459,35 @@ def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
                                        sheet_name: str,
                                        df: pd.DataFrame,
                                        header_rows: List[Tuple[str, str]]):
-    """Escritura segura: memoria constante, chunks y sin add_table en tablas enormes."""
     header_df = pd.DataFrame(header_rows, columns=["Descripción", "Valor"])
     header_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
     ws = writer.sheets[sheet_name]
 
-    ws.set_default_row(15)
-    ws.set_row(0, 15)
-    ws.set_row(1, 15)
-
     start_row = len(header_df) + 2
+    df = df.copy()
 
-    # límites “seguros”
-    ADD_TABLE_MAX = 50_000
-    CHUNK_ROWS = 200_000
+    # Evita estilos pesados en datasets gigantes
+    huge = len(df) >= SAFE_DISABLE_TABLE_AT_ROWS
+
+    df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
 
     nrow, ncol = df.shape
-
-    if nrow > CHUNK_ROWS:
-        # Escritura por trozos, sin add_table
-        r = start_row
-        first = True
-        for i in range(0, nrow, CHUNK_ROWS):
-            chunk = df.iloc[i:i + CHUNK_ROWS]
-            chunk.to_excel(writer, sheet_name=sheet_name, index=False, startrow=r, header=first)
-            r += len(chunk) + (1 if first else 0)
-            first = False
-    else:
-        # Escritura estándar
-        df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
-
-        # add_table solo si no es enorme
-        if nrow <= ADD_TABLE_MAX:
-            start_col_letter = "A"
-            end_col_letter = _col_letter(ncol - 1)
-            rng = f"{start_col_letter}{start_row+1}:{end_col_letter}{start_row + max(nrow,1) + 1}"
-            ws.add_table(rng, {
-                "name": f"{sheet_name.replace(' ', '_')}_tbl",
-                "header_row": True,
-                "style": "Table Style Medium 9",
-                "columns": [{"header": str(h)} for h in df.columns]
-            })
-
     ws.freeze_panes(start_row + 1, 0)
     ws.set_column(0, max(0, ncol - 1), 18)
 
+    if not huge:
+        start_col_letter = "A"
+        end_col_letter = _col_letter(ncol - 1)
+        rng = f"{start_col_letter}{start_row+1}:{end_col_letter}{start_row + max(nrow,1) + 1}"
+        ws.add_table(rng, {
+            "name": f"{sheet_name.replace(' ', '_')}_tbl",
+            "header_row": True,
+            "style": "Table Style Medium 9",
+            "columns": [{"header": str(h)} for h in df.columns]
+        })
 
-# ───────────────────────── Función principal ─────────────────────────
+
+# ───────────────────────── Función principal síncrona ─────────────────────────
 def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] | None,
                              outview_factor: float | None = None):
     """
@@ -508,7 +507,7 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     df_o_raw = _read_out_robusto(out_file)
     df_o = _transform_outview_enriquecido(df_o_raw, factor_outview=outview_factor) if not df_o_raw.empty else pd.DataFrame()
 
-    # CONSOLIDADO unificado SOLO si existen ambas fuentes
+    # Consolidado sólo si hay ambas
     if not df_m.empty and not df_o.empty:
         mon_u = _to_unified(df_m, _MONITOR_MAP)
         out_u = _to_unified(df_o, _OUT_MAP)
@@ -517,68 +516,200 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     else:
         df_c = pd.DataFrame()
 
-    # ===== OutView: eliminar columnas internas (no deben aparecer en Excel ni en vista previa) =====
+    # OutView público (oculta internas y “Semana en Mes por Código”)
     internal_targets = {
-        "código único", "código +1 pieza", "denominador",
-        "tarifa × superficie", "tarifa × superficie (1ra por código único)",
+        "código único","código +1 pieza","denominador",
+        "tarifa × superficie","tarifa × superficie (1ra por código único)",
         "semana en mes por código",
-        "nb_extrae_6_7", "fecha_ab", "proveedor_ac", "tipoelemento_ad", "distrito_ae",
-        "avenida_af", "nrocallecuadra_ag", "orientacionvia_ah", "marca_ai",
-        "conteo_ab_ai", "conteo_z_ab_ai", "tarifas_div3", "tarifas_div3_sobre_conteo",
-        "suma_am_z_ab_ai", "topetipo_aq", "suma_am_topada_tipo", "sumatopada_div_conteoz"
+        "nb_extrae_6_7","fecha_ab","proveedor_ac","tipoelemento_ad","distrito_ae",
+        "avenida_af","nrocallecuadra_ag","orientacionvia_ah","marca_ai",
+        "conteo_ab_ai","conteo_z_ab_ai","tarifas_div3","tarifas_div3_sobre_conteo",
+        "suma_am_z_ab_ai","topetipo_aq","suma_am_topada_tipo","sumatopada_div_conteoz",
     }
-
-    def _norm(s: str) -> str:
-        return str(s).strip().casefold()
-
-    drop_cols = [c for c in df_o.columns if _norm(c) in internal_targets]
+    def _norm(s: str) -> str: return str(s).strip().casefold()
+    drop_cols = [c for c in df_o.columns if _norm(c) in internal_targets or _norm(c) == "semana en mes por código"]
     df_o_public = df_o.drop(columns=drop_cols, errors="ignore")
 
-    # Excel (SIN engine_kwargs para compatibilidad amplia)
+    # Excel
     xlsx = BytesIO()
-    with pd.ExcelWriter(
-        xlsx,
-        engine="xlsxwriter",
-        datetime_format="dd/mm/yyyy",
-        date_format="dd/mm/yyyy",
-    ) as w:
-        if not df_m.empty:
-            hdr_m = _header_rows_for(
-                df_m, fecha_col="DIA", marca_col="MARCA",
-                extras=[("SECTOR","Sectores"), ("CATEGORIA","Categorías"), ("REGION/ÁMBITO","Regiones")]
-            )
-            _write_sheet_with_header_and_table(w, sheet_name="Monitor", df=df_m, header_rows=hdr_m)
+    try:
+        with pd.ExcelWriter(xlsx, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
+            if not df_m.empty:
+                hdr_m = _header_rows_for(
+                    df_m, fecha_col="DIA", marca_col="MARCA",
+                    extras=[("SECTOR","Sectores"), ("CATEGORIA","Categorías"), ("REGION/ÁMBITO","Regiones")]
+                )
+                _write_sheet_with_header_and_table(w, sheet_name="Monitor", df=df_m, header_rows=hdr_m)
 
-        if not df_o.empty:
-            hdr_o = _header_rows_for(
-                df_o, fecha_col="Fecha", marca_col="Anunciante",
-                extras=[("Tipo Elemento","Tipo"), ("Proveedor","Proveedor"), ("Región","Regiones")]
-            )
-            _write_sheet_with_header_and_table(w, sheet_name="OutView", df=df_o_public, header_rows=hdr_o)
+            if not df_o.empty:
+                hdr_o = _header_rows_for(
+                    df_o, fecha_col="Fecha", marca_col="Anunciante",
+                    extras=[("Tipo Elemento","Tipo"), ("Proveedor","Proveedor"), ("Región","Regiones")]
+                )
+                _write_sheet_with_header_and_table(w, sheet_name="OutView", df=df_o_public, header_rows=hdr_o)
 
-        if not df_c.empty:  # solo si hay ambas
-            d1, d2 = _date_range(df_c, ["FECHA"])
-            hdr_c = [("Filas", len(df_c)),
-                     ("Rango de fechas", f"{d1} - {d2}" if d1 and d2 else ""),
-                     ("Fuentes incluidas", "Monitor + OutView")]
-            _write_sheet_with_header_and_table(w, sheet_name="Consolidado", df=df_c, header_rows=hdr_c)
-
-        # Ajuste visual global
-        wb = w.book
-        fmt = wb.add_format({"valign": "vcenter"})
-        for sh in ("Monitor", "OutView", "Consolidado"):
-            if sh in w.sheets:
-                ws = w.sheets[sh]
-                ws.set_column(0, 0, 22, fmt)
-                ws.set_column(1, 60, 18, fmt)
+            if not df_c.empty:
+                d1, d2 = _date_range(df_c, ["FECHA"])
+                hdr_c = [("Filas", len(df_c)),
+                         ("Rango de fechas", f"{d1} - {d2}" if d1 and d2 else ""),
+                         ("Fuentes incluidas", "Monitor + OutView")]
+                _write_sheet_with_header_and_table(w, sheet_name="Consolidado", df=df_c, header_rows=hdr_c)
+    except Exception:
+        if SAFE_BIG_EXPORT_FALLBACK:
+            # Fallback: CSV ZIP (si algo pesado impide Excel)
+            import zipfile, tempfile
+            tempdir = Path(tempfile.mkdtemp(prefix="mougli_fallback_"))
+            csv_path = tempdir / "SiReset_Mougli.csv"
+            df_for_csv = df_c if not df_c.empty else (df_m if not df_m.empty else df_o_public)
+            df_for_csv.to_csv(csv_path, index=False)
+            zip_buf = BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.write(csv_path, arcname=csv_path.name)
+            zip_buf.seek(0)
+            return df_for_csv, zip_buf  # el front sabrá cambiar el filename/mime
+        else:
+            raise
 
     xlsx.seek(0)
 
-    # Resultado principal para vista previa:
+    # Resultado para vista previa (limitado para no saturar la RAM en front)
     if not df_c.empty:
         df_result = df_c
     elif not df_m.empty:
         df_result = df_m
     else:
         df_result = df_o_public
+
+    if len(df_result) > SAFE_MAX_PREVIEW_ROWS:
+        df_result = df_result.head(SAFE_MAX_PREVIEW_ROWS).copy()
+
     return df_result, xlsx
+
+
+# ─────────────────────────── Worker CLI (subproceso) ──────────────────────────
+def _safe_write(path: Path, text: str):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _update_progress(pfile: Path, **payload):
+    payload["ts"] = int(time.time())
+    try:
+        if pfile.exists():
+            current = json.loads(pfile.read_text(encoding="utf-8"))
+        else:
+            current = {}
+    except Exception:
+        current = {}
+    current.update(payload)
+    _safe_write(pfile, json.dumps(current, indent=2))
+
+
+def _append_log(lfile: Path, msg: str):
+    try:
+        lfile.parent.mkdir(parents=True, exist_ok=True)
+        with lfile.open("a", encoding="utf-8") as f:
+            f.write(msg.rstrip() + "\n")
+    except Exception:
+        pass
+
+
+def run_worker_cli():
+    """
+    Ejecuta procesamiento en modo worker (aislado), escribiendo progreso y log.
+    Uso:
+      python -m core.mougli_core --as-worker --monitor <path|optional> --outview <path|optional> \
+        --out-xlsx <ruta_salida> --progress <progress.json> --log <job.log> \
+        --factores-json '<json>' --outview-factor 1.25
+    """
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--as-worker", action="store_true", default=False)
+    ap.add_argument("--monitor", type=str, default=None)
+    ap.add_argument("--outview", type=str, default=None)
+    ap.add_argument("--out-xlsx", type=str, required=True)
+    ap.add_argument("--preview-parquet", type=str, default=None)
+    ap.add_argument("--progress", type=str, required=True)
+    ap.add_argument("--log", type=str, required=True)
+    ap.add_argument("--factores-json", type=str, default=None)
+    ap.add_argument("--outview-factor", type=float, default=None)
+    args = ap.parse_args()
+
+    prog = Path(args.progress)
+    logf = Path(args.log)
+
+    try:
+        _update_progress(prog, status="iniciando")
+        _append_log(logf, ">> Worker iniciado")
+
+        factores = None
+        if args.factores_json:
+            try:
+                factores = json.loads(args.factores_json)
+            except Exception as e:
+                _append_log(logf, f"[WARN] No pude leer factores_json: {e}")
+                factores = None
+
+        mf = open(args.monitor, "rb") if args.monitor else None
+        of = open(args.outview, "rb") if args.outview else None
+
+        _update_progress(prog, status="procesando")
+        df_result, artifact = procesar_monitor_outview(
+            mf, of, factores=factores, outview_factor=args.outview_factor
+        )
+
+        # Guardar artefacto (Excel o ZIP)
+        out_path = Path(args.out_xlsx)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(artifact, BytesIO):
+            # Excel OK
+            with open(out_path, "wb") as f:
+                f.write(artifact.getvalue())
+            _append_log(logf, f">> Excel escrito: {out_path.name} ({out_path.stat().st_size} bytes)")
+            result_type = "excel"
+            result_name = out_path.name
+        else:
+            # ZIP CSV
+            out_zip = out_path.with_suffix(".zip")
+            with open(out_zip, "wb") as f:
+                f.write(artifact.getvalue())
+            _append_log(logf, f">> ZIP escrito: {out_zip.name} ({out_zip.stat().st_size} bytes)")
+            result_type = "zip"
+            result_name = out_zip.name
+
+        # Guardar preview ligero
+        try:
+            if args.preview_parquet:
+                import pyarrow as pa  # opcional
+                import pyarrow.parquet as pq
+                pv_path = Path(args.preview_parquet)
+                if len(df_result) > SAFE_MAX_PREVIEW_ROWS:
+                    df_small = df_result.head(SAFE_MAX_PREVIEW_ROWS).copy()
+                else:
+                    df_small = df_result
+                table = pa.Table.from_pandas(df_small)
+                pq.write_table(table, pv_path)
+                _append_log(logf, f">> Vista previa guardada: {pv_path.name}")
+        except Exception as e:
+            _append_log(logf, f"[WARN] No pude guardar preview parquet: {e}")
+
+        _update_progress(prog, status="ok", result=result_name, result_type=result_type)
+        _append_log(logf, ">> Worker terminado OK")
+
+    except MemoryError:
+        _append_log(logf, "[FATAL] MemoryError en worker")
+        _update_progress(prog, status="error", error="MemoryError")
+        sys.exit(2)
+    except Exception as e:
+        _append_log(logf, ">> Excepción:\n" + "".join(traceback.format_exception(type(e), e, e.__traceback__)))
+        _update_progress(prog, status="error", error=str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    # Si se invoca con --as-worker, ejecuta el modo worker
+    if "--as-worker" in sys.argv:
+        run_worker_cli()
