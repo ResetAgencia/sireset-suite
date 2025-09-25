@@ -1,5 +1,5 @@
 # core/mougli_core.py
-# Mougli core + Worker CLI robusto
+# Mougli core + Worker CLI robusto (compatible Python 3.8/3.9)
 from __future__ import annotations
 
 import io
@@ -177,7 +177,7 @@ def _aplicar_factores_monitor(df: pd.DataFrame, factores: Dict[str, float]) -> p
     return df
 
 
-def _version_column(df: pd.DataFrame) -> str | None:
+def _version_column(df: pd.DataFrame) -> Optional[str]:
     for c in df.columns:
         if str(c).lower().startswith("vers"):
             return c
@@ -306,7 +306,8 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     tope = tipo_up.map(tipo_to_base).astype(float) * (4.0/3.0)
     df["TopeTipo_AQ"] = tope
     an_val = pd.to_numeric(df["Suma_AM_Z_AB_AI"], errors="coerce")
-    df["Suma_AM_Topada_Tipo"] = np.minimum(an_val, tope) if not np.isnan(tope).all() else an_val
+    # Si tope es todo NaN, dejamos an_val tal cual
+    df["Suma_AM_Topada_Tipo"] = np.where(np.isnan(tope), an_val, np.minimum(an_val, tope))
 
     denom = pd.to_numeric(df["Conteo_Z_AB_AI"], errors="coerce")
     df["SumaTopada_div_ConteoZ"] = np.where(
@@ -349,14 +350,14 @@ _DATE_MON = ["DIA"]
 _DATE_OUT = ["Fecha", "FECHA"]
 
 
-def _brands_count(df: pd.DataFrame, candidates: List[str]) -> int | None:
+def _brands_count(df: pd.DataFrame, candidates: List[str]) -> Optional[int]:
     for c in candidates:
         if c in df.columns:
             return int(df[c].dropna().astype(str).nunique())
     return None
 
 
-def _date_range(df: pd.DataFrame, candidates: List[str]) -> Tuple[str, str] | Tuple[None, None]:
+def _date_range(df: pd.DataFrame, candidates: List[str]) -> Tuple[Optional[str], Optional[str]]:
     for c in candidates:
         if c in df.columns:
             s = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
@@ -422,8 +423,10 @@ def _to_unified(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
 
 
 # ───────────────────────── Excel (encabezado + tabla) ─────────────────────────
-def _header_rows_for(df: pd.DataFrame, *, fecha_col: str | None, marca_col: str | None,
-                     extras: List[Tuple[str, str]] | None = None) -> List[Tuple[str, str]]:
+def _header_rows_for(df: pd.DataFrame, *,
+                     fecha_col: Optional[str],
+                     marca_col: Optional[str],
+                     extras: Optional[List[Tuple[str, str]]] = None) -> List[Tuple[str, str]]:
     filas = [("Filas", len(df))]
     if fecha_col and fecha_col in df.columns and not df.empty:
         fmin, fmax = df[fecha_col].min(), df[fecha_col].max()
@@ -472,8 +475,10 @@ def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
 
 
 # ───────────────────────── Función principal (UI directa) ─────────────────────
-def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] | None,
-                             outview_factor: float | None = None):
+def procesar_monitor_outview(monitor_file,
+                             out_file,
+                             factores: Optional[Dict[str, float]],
+                             outview_factor: Optional[float] = None):
     factores = factores or load_monitor_factors()
     outview_factor = float(outview_factor if outview_factor is not None else load_outview_factor())
 
@@ -491,6 +496,7 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     else:
         df_c = pd.DataFrame()
 
+    # Ocultar internas (incluye “Semana en Mes por Código”) en Excel y preview
     internal_targets = {
         "código único","código +1 pieza","denominador",
         "tarifa × superficie","tarifa × superficie (1ra por código único)",
