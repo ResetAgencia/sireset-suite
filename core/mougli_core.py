@@ -1,18 +1,14 @@
 # core/mougli_core.py
-# Mougli core + Worker CLI robusto
-from __future__ import annotations
+# ✅ Listo para copiar y reemplazar
+# - Oculta "Semana en Mes por Código" y columnas internas en Excel y preview.
+# - Lecturas robustas de CSV/XLSX y downcast para ahorrar memoria.
+# - Evita add_table en archivos gigantes para no agotar memoria.
 
 import io
-import os
-import sys
 import json
-import csv
-import gc
-import argparse
-import traceback
-from io import BytesIO, StringIO
+from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -84,6 +80,23 @@ def _col_letter(idx: int) -> str:
     return s
 
 
+def _downcast_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Reduce memoria sin alterar valores."""
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    for c in df.select_dtypes(include=["int64", "int32"]).columns:
+        df[c] = pd.to_numeric(df[c], downcast="integer")
+    for c in df.select_dtypes(include=["float64", "float32"]).columns:
+        df[c] = pd.to_numeric(df[c], downcast="float")
+    # Para textos muy repetidos, categorizar (sólo si muchas repeticiones)
+    for c in df.select_dtypes(include=["object"]).columns:
+        uniq = df[c].nunique(dropna=True)
+        if 0 < uniq < max(50, len(df) // 20):
+            df[c] = df[c].astype("category")
+    return df
+
+
 # ───────────────────────── Lectores de fuentes ──────────────────────
 def _read_monitor_txt(file) -> pd.DataFrame:
     """Lee TXT de Monitor detectando cabecera con '|MEDIO|' y normaliza columnas."""
@@ -95,14 +108,14 @@ def _read_monitor_txt(file) -> pd.DataFrame:
     lines = text.splitlines()
 
     hdr_idx = None
-    for i, l in enumerate(lines[:80]):
+    for i, l in enumerate(lines[:60]):
         if "|MEDIO|" in l.upper():
             hdr_idx = i
             break
     if hdr_idx is None:
         return pd.DataFrame({"linea": [l for l in lines if l.strip()]})
 
-    buf = StringIO("\n".join(lines[hdr_idx:]))
+    buf = io.StringIO("\n".join(lines[hdr_idx:]))
     df = pd.read_csv(buf, sep="|", engine="python")
 
     df.columns = df.columns.astype(str).str.strip()
@@ -129,101 +142,32 @@ def _read_monitor_txt(file) -> pd.DataFrame:
 
     order = [c for c in ["DIA", "AÑO", "MES", "SEMANA"] if c in df.columns]
     df = df[[*order] + [c for c in df.columns if c not in order]]
-    return df
+    return _downcast_df(df)
 
 
 def _read_out_robusto(file) -> pd.DataFrame:
-    """
-    Lector robusto y liviano de OutView:
-    - Carga solo columnas necesarias (reduce RAM).
-    - Corrige formatos numéricos de 'Tarifa S/.' (punto de miles/coma decimal).
-    - Usa openpyxl en modo read_only para XLSX grandes.
-    """
     if file is None:
         return pd.DataFrame()
-
-    REQUIRED = {
-        "Fecha","Latitud","Longitud","Avenida","Nro Calle/Cuadra","Marca","Tipo Elemento",
-        "Orientación de Vía","Tarifa S/.","Proveedor","Distrito","Cod.Proveedor","NombreBase",
-        "Item","Versión","Categoría","Anunciante","Sector","Región","Producto","Agencia"
-    }
-    usecols_cb = lambda c: str(c).strip() in REQUIRED
-
     name = (getattr(file, "name", "") or "").lower()
-
-    def _fix_tarifa(df: pd.DataFrame) -> pd.DataFrame:
-        if "Tarifa S/." in df.columns:
-            s = df["Tarifa S/."].astype(str).str.strip()
-            # quita punto de miles: 180.498 -> 180498
-            s = s.str.replace(r"(?<=\d)\.(?=\d{3}(\D|$))", "", regex=True)
-            # coma decimal -> punto
-            s = s.str.replace(",", ".", regex=False)
-            df["Tarifa S/."] = pd.to_numeric(s, errors="coerce")
-        return df
-
     try:
         if name.endswith(".csv"):
-            engine = None
-            try:
-                import pyarrow  # noqa: F401
-                engine = "pyarrow"
-            except Exception:
-                engine = None
-
             try:
                 file.seek(0)
-            except Exception:
-                pass
-
-            df = pd.read_csv(
-                file,
-                usecols=usecols_cb,
-                engine=engine,
-                low_memory=False,
-                dtype_backend="pyarrow" if engine == "pyarrow" else "numpy"
-            )
-            return _fix_tarifa(df)
-
-        # XLSX read_only
-        try:
-            try:
+                df = pd.read_csv(file, low_memory=True, on_bad_lines="skip")
+            except UnicodeDecodeError:
                 file.seek(0)
-            except Exception:
-                pass
-            from openpyxl import load_workbook
-            wb = load_workbook(filename=file, read_only=True, data_only=True)
-            ws = wb.active
-            headers = None
-            rows = []
-            for i, row in enumerate(ws.iter_rows(values_only=True)):
-                if i == 0:
-                    headers = [str(x) if x is not None else "" for x in row]
-                    keep_idx = [j for j, h in enumerate(headers) if h.strip() in REQUIRED]
-                else:
-                    if not row:
-                        continue
-                    rows.append([row[j] for j in keep_idx])
-            try:
-                wb.close()
-            except Exception:
-                pass
-            if not rows:
-                return pd.DataFrame(columns=REQUIRED)
-            df = pd.DataFrame(rows, columns=[headers[j] for j in keep_idx])
-            return _fix_tarifa(df)
-        except Exception:
+                df = pd.read_csv(file, sep=";", encoding="latin-1", low_memory=True, on_bad_lines="skip")
+        else:
             file.seek(0)
-            df = pd.read_excel(file, usecols=usecols_cb, engine="openpyxl")
-            return _fix_tarifa(df)
+            df = pd.read_excel(file, engine="openpyxl")
     except Exception:
         try:
             file.seek(0)
-            df = pd.read_csv(file, sep=";", usecols=usecols_cb, encoding="latin-1", low_memory=False)
-            return _fix_tarifa(df)
+            df = pd.read_csv(file, sep=";", encoding="latin-1", low_memory=True, on_bad_lines="skip")
         except Exception:
             file.seek(0)
-            df = pd.read_excel(file, usecols=usecols_cb, engine="openpyxl")
-            return _fix_tarifa(df)
+            df = pd.read_excel(file, engine="openpyxl")
+    return _downcast_df(df)
 
 
 # ───────────────────────── Transformaciones ─────────────────────────
@@ -245,7 +189,7 @@ def _aplicar_factores_monitor(df: pd.DataFrame, factores: Dict[str, float]) -> p
         return float(factores.get(clave, 1.0)) if clave else 1.0
 
     df["INVERSION"] = df.apply(lambda r: r["INVERSION"] * fx(r["MEDIO"]), axis=1)
-    return df
+    return _downcast_df(df)
 
 
 def _version_column(df: pd.DataFrame) -> str | None:
@@ -292,16 +236,14 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     # Métricas base
     df["Denominador"] = df.groupby("Código único")["Código único"].transform("size")
     if ver_col:
-        # nombre visible
         df["Q versiones por elemento"] = df.groupby("Código único")[ver_col].transform("nunique")
 
-    # visible (minúscula exacta pedida)
     df["+1 superficie"] = df.groupby("Código +1 pieza")["Código +1 pieza"].transform("size")
 
     tarifa_num = pd.to_numeric(df.get("Tarifa S/."), errors="coerce").fillna(0)
     first_in_piece = (df.groupby("Código +1 pieza").cumcount() == 0)
 
-    # interna para cálculo
+    # Tarifa × Superficie SOLO primera fila por pieza (para cálculo) con factor (columna interna)
     df["Tarifa × Superficie"] = np.where(first_in_piece, tarifa_num * df["+1 superficie"], 0.0)
     df["Tarifa × Superficie"] = (df["Tarifa × Superficie"] * float(factor_outview)) / 3.8
 
@@ -311,7 +253,6 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     order_in_month = (
         df.sort_values(["Código único","_YM","_FechaDT"]).groupby(["Código único","_YM"]).cumcount()
     )
-    # visible
     df["Conteo Mensual"] = (order_in_month == 0).astype(int)
 
     # Inversión: primera TxS por Código único / nº de piezas del código (interna derivada)
@@ -361,7 +302,7 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     df["TarifaS_div3"] = tarifa_num / 3.0
     df["TarifaS_div3_sobre_Conteo"] = df["TarifaS_div3"] / df["Conteo_AB_AI"].astype(float)
 
-    # SUMAR.SI.CONJUNTO — interna
+    # SUMAR.SI.CONJUNTO(AM ; Z==AA ; D..N==AC..AI) — interna
     sum_keys = ["NB_EXTRAE_6_7","Proveedor","Tipo Elemento","Distrito",
                 "Avenida","Nro Calle/Cuadra","Orientación de Vía","Marca"]
     for c in sum_keys:
@@ -386,7 +327,7 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     an_val = pd.to_numeric(df["Suma_AM_Z_AB_AI"], errors="coerce")
     df["Suma_AM_Topada_Tipo"] = np.where(np.isnan(tope), an_val, np.minimum(an_val, tope))
 
-    # División AO/AK y Tarifa Real ($) — visible
+    # División AO/AK y Tarifa Real ($) — Tarifa Real ($) visible
     denom = pd.to_numeric(df["Conteo_Z_AB_AI"], errors="coerce")
     df["SumaTopada_div_ConteoZ"] = np.where(
         denom > 0,
@@ -422,7 +363,7 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     ]
     tail = [c for c in tail if c]
     cols = [*base] + [c for c in df.columns if c not in (*base, *tail, "_FechaDT", "_YM")] + tail
-    return df[cols].copy()
+    return _downcast_df(df[cols].copy())
 
 
 # ───────────────────────── Resúmenes y consolidado ─────────────────────────
@@ -522,7 +463,7 @@ def _header_rows_for(df: pd.DataFrame, *, fecha_col: str | None, marca_col: str 
     return filas
 
 
-def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
+def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, * ,
                                        sheet_name: str,
                                        df: pd.DataFrame,
                                        header_rows: List[Tuple[str, str]]):
@@ -530,32 +471,32 @@ def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
     header_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
     ws = writer.sheets[sheet_name]
 
-    # Altura fija por defecto (no auto-ajustar)
     ws.set_default_row(15)
     ws.set_row(0, 15)
     ws.set_row(1, 15)
 
-    # Datos como tabla
     start_row = len(header_df) + 2
     df = df.copy()
     df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
 
     nrow, ncol = df.shape
-    start_col_letter = "A"
-    end_col_letter = _col_letter(ncol - 1)
-    rng = f"{start_col_letter}{start_row+1}:{end_col_letter}{start_row + max(nrow,1) + 1}"
+    # Evitar add_table en hojas gigantes (seguridad memoria)
+    if nrow <= 150_000 and ncol <= 60:
+        start_col_letter = "A"
+        end_col_letter = _col_letter(ncol - 1)
+        rng = f"{start_col_letter}{start_row+1}:{end_col_letter}{start_row + max(nrow,1) + 1}"
 
-    ws.add_table(rng, {
-        "name": f"{sheet_name.replace(' ', '_')}_tbl",
-        "header_row": True,
-        "style": "Table Style Medium 9",
-        "columns": [{"header": str(h)} for h in df.columns]
-    })
-    ws.freeze_panes(start_row + 1, 0)
+        ws.add_table(rng, {
+            "name": f"{sheet_name.replace(' ', '_')}_tbl",
+            "header_row": True,
+            "style": "Table Style Medium 9",
+            "columns": [{"header": str(h)} for h in df.columns]
+        })
+        ws.freeze_panes(start_row + 1, 0)
     ws.set_column(0, max(0, ncol - 1), 18)
 
 
-# ───────────────────────── Función principal (UI directa) ─────────────────────
+# ───────────────────────── Función principal ─────────────────────────
 def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] | None,
                              outview_factor: float | None = None):
     """
@@ -584,29 +525,30 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     else:
         df_c = pd.DataFrame()
 
-    # OutView para Excel/vista pública: ocultar internas, incluyendo “Semana en Mes por Código”
+    # ===== OutView: eliminar columnas internas (no deben aparecer en Excel ni en preview) =====
+    # Mantener VISIBLES: "Conteo Mensual", "Q versiones por elemento", "Tarifa Real ($)", "+1 superficie"
     internal_targets = {
-        "código único","código +1 pieza","denominador",
-        "tarifa × superficie","tarifa × superficie (1ra por código único)",
-        "semana en mes por código",
+        "código único", "codigo unico",
+        "código +1 pieza", "codigo +1 pieza",
+        "denominador",
+        "tarifa × superficie", "tarifa x superficie",
+        "tarifa × superficie (1ra por código único)", "tarifa x superficie (1ra por codigo unico)",
+        "semana en mes por código", "semana en mes por codigo",
         "nb_extrae_6_7","fecha_ab","proveedor_ac","tipoelemento_ad","distrito_ae",
         "avenida_af","nrocallecuadra_ag","orientacionvia_ah","marca_ai",
         "conteo_ab_ai","conteo_z_ab_ai","tarifas_div3","tarifas_div3_sobre_conteo",
         "suma_am_z_ab_ai","topetipo_aq","suma_am_topada_tipo","sumatopada_div_conteoz"
     }
-    def _norm(s: str) -> str: return str(s).strip().casefold()
+
+    def _norm(s: str) -> str:
+        return str(s).strip().casefold()
+
     drop_cols = [c for c in df_o.columns if _norm(c) in internal_targets]
     df_o_public = df_o.drop(columns=drop_cols, errors="ignore")
 
     # Excel
     xlsx = BytesIO()
-    with pd.ExcelWriter(
-        xlsx,
-        engine="xlsxwriter",
-        datetime_format="dd/mm/yyyy",
-        date_format="dd/mm/yyyy",
-        engine_kwargs={"options": {"constant_memory": True, "strings_to_urls": False}}
-    ) as w:
+    with pd.ExcelWriter(xlsx, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
         if not df_m.empty:
             hdr_m = _header_rows_for(
                 df_m, fecha_col="DIA", marca_col="MARCA",
@@ -614,9 +556,9 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
             )
             _write_sheet_with_header_and_table(w, sheet_name="Monitor", df=df_m, header_rows=hdr_m)
 
-        if not df_o_public.empty:
+        if not df_o.empty:
             hdr_o = _header_rows_for(
-                df_o_public, fecha_col="Fecha", marca_col="Anunciante",
+                df_o, fecha_col="Fecha", marca_col="Anunciante",
                 extras=[("Tipo Elemento","Tipo"), ("Proveedor","Proveedor"), ("Región","Regiones")]
             )
             _write_sheet_with_header_and_table(w, sheet_name="OutView", df=df_o_public, header_rows=hdr_o)
@@ -628,7 +570,6 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                      ("Fuentes incluidas", "Monitor + OutView")]
             _write_sheet_with_header_and_table(w, sheet_name="Consolidado", df=df_c, header_rows=hdr_c)
 
-        # Ajuste visual global
         wb = w.book
         fmt = wb.add_format({"valign": "vcenter"})
         for sh in ("Monitor", "OutView", "Consolidado"):
@@ -638,6 +579,7 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                 ws.set_column(1, 60, 18, fmt)
 
     xlsx.seek(0)
+
     # Resultado principal para vista previa:
     if not df_c.empty:
         df_result = df_c
@@ -647,181 +589,3 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
         df_result = df_o_public
     return df_result, xlsx
 
-
-# ───────────────────────────── Worker CLI (background) ────────────────────────
-def _json_atomic_write(path: Path, payload: dict):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
-
-
-def _log_append(log_path: Path, msg: str):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(msg.rstrip() + "\n")
-
-
-def _progress(progress_path: Path, status: str, step: int, total: int, message: str):
-    _json_atomic_write(progress_path, {
-        "status": status, "step": step, "total": total,
-        "message": message, "pid": os.getpid()
-    })
-
-
-def _xlsx_to_csv_stream(xlsx_path: Path, csv_writer: csv.writer) -> None:
-    """Convierte la PRIMERA hoja a CSV por streaming (sin cargar todo en memoria)."""
-    try:
-        from openpyxl import load_workbook
-    except Exception:
-        # Fallback: intenta con pandas (puede usar más memoria)
-        df = pd.read_excel(xlsx_path, engine="openpyxl")
-        for i, row in enumerate(df.itertuples(index=False, name=None)):
-            if i == 0:
-                csv_writer.writerow(list(df.columns))
-            csv_writer.writerow(list(row))
-        return
-
-    wb = load_workbook(filename=str(xlsx_path), read_only=True, data_only=True)
-    ws = wb.active
-    first = True
-    for r in ws.iter_rows(values_only=True):
-        if first:
-            # Si la primera fila aparenta ser cabecera
-            headers = [str(x) if x is not None else "" for x in r]
-            csv_writer.writerow(headers)
-            first = False
-        else:
-            csv_writer.writerow(["" if x is None else x for x in r])
-    try:
-        wb.close()
-    except Exception:
-        pass
-
-
-def _combine_monitor_txt(inputs: List[Path], out_txt: Path):
-    out_txt.parent.mkdir(parents=True, exist_ok=True)
-    with out_txt.open("wb") as w:
-        for i, p in enumerate(inputs):
-            with p.open("rb") as r:
-                if i > 0:
-                    w.write(b"\n")
-                for chunk in iter(lambda: r.read(1024 * 1024), b""):
-                    w.write(chunk)
-
-
-def _combine_outview_to_csv(inputs: List[Path], out_csv: Path):
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with out_csv.open("w", newline="", encoding="utf-8") as f_out:
-        writer = csv.writer(f_out)
-        wrote_header = False
-        for p in inputs:
-            name = p.name.lower()
-            if name.endswith(".csv"):
-                # Stream de CSV en chunks, saltando cabeceras repetidas
-                with p.open("r", encoding="utf-8", errors="ignore", newline="") as f_in:
-                    reader = csv.reader(f_in)
-                    for i, row in enumerate(reader):
-                        if i == 0:
-                            if wrote_header:
-                                continue
-                            wrote_header = True
-                        writer.writerow(row)
-            else:
-                # XLSX -> CSV por streaming
-                if not wrote_header:
-                    # _xlsx_to_csv_stream se encargará de escribir cabecera
-                    pass
-                _xlsx_to_csv_stream(p, writer)
-                wrote_header = True
-
-
-def worker_run(args):
-    progress = Path(args.progress)
-    logf = Path(args.log)
-    outxlsx = Path(args.out_xlsx)
-
-    try:
-        total_steps = 6
-        _progress(progress, "running", 0, total_steps, "Inicializando…")
-
-        # Combinar entradas
-        mon_inputs = [Path(x) for x in (args.monitor or []) if x]
-        out_inputs = [Path(x) for x in (args.outview or []) if x]
-        job_dir = Path(args.job_dir) if args.job_dir else outxlsx.parent
-
-        comb_mon = job_dir / "combined_monitor.txt" if mon_inputs else None
-        comb_out = job_dir / "combined_outview.csv" if out_inputs else None
-
-        step = 1
-        if mon_inputs:
-            _progress(progress, "running", step, total_steps, "Combinando Monitor…")
-            _combine_monitor_txt(mon_inputs, comb_mon)
-            _log_append(logf, f"Monitor combinado en {comb_mon}")
-        step += 1
-        if out_inputs:
-            _progress(progress, "running", step, total_steps, "Combinando OutView…")
-            _combine_outview_to_csv(out_inputs, comb_out)
-            _log_append(logf, f"OutView combinado en {comb_out}")
-        step += 1
-
-        # Procesar con la misma lógica de UI
-        _progress(progress, "running", step, total_steps, "Procesando cálculos…")
-        factores = json.loads(args.factores_json) if args.factores_json else load_monitor_factors()
-        out_factor = float(args.outview_factor) if args.outview_factor else load_outview_factor()
-
-        # Abrir handles
-        mon_fh = open(comb_mon, "rb") if comb_mon and comb_mon.exists() else None
-        out_fh = open(comb_out, "rb") if comb_out and comb_out.exists() else None
-
-        try:
-            df_result, xbytes = procesar_monitor_outview(mon_fh, out_fh, factores=factores, outview_factor=out_factor)
-        finally:
-            for fh in (mon_fh, out_fh):
-                try:
-                    if fh: fh.close()
-                except Exception:
-                    pass
-
-        step += 1
-        _progress(progress, "running", step, total_steps, "Generando Excel…")
-        outxlsx.parent.mkdir(parents=True, exist_ok=True)
-        with outxlsx.open("wb") as w:
-            w.write(xbytes.getvalue())
-
-        step += 1
-        _progress(progress, "done", step, total_steps, "Completado")
-        _log_append(logf, f"Éxito: {outxlsx}")
-
-        # Limpieza ligera
-        gc.collect()
-
-    except Exception as e:
-        _log_append(logf, "ERROR:\n" + "".join(traceback.format_exception(e)))
-        _progress(progress, "error", 1, 1, f"{type(e).__name__}: {e}")
-
-
-# ──────────────────────────────── CLI entrypoint ──────────────────────────────
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Mougli worker/CLI")
-    parser.add_argument("--as-worker", action="store_true", help="Ejecutar en modo worker")
-    parser.add_argument("--monitor", action="append", help="Ruta(s) de archivos Monitor .txt", default=[])
-    parser.add_argument("--outview", action="append", help="Ruta(s) de archivos OutView .csv/.xlsx", default=[])
-    parser.add_argument("--out-xlsx", required=False, help="Ruta de salida Excel")
-    parser.add_argument("--progress", required=False, help="Ruta del progress.json")
-    parser.add_argument("--log", required=False, help="Ruta del job.log")
-    parser.add_argument("--job-dir", required=False, help="Directorio del job (para combinados)")
-    parser.add_argument("--factores-json", default="", help="JSON de factores monitor")
-    parser.add_argument("--outview-factor", default="", help="Factor outview")
-    args = parser.parse_args()
-
-    if args.as_worker:
-        worker_run(args)
-    else:
-        # Uso simple manual (debug): lee los primeros paths si existen
-        mon = open(args.monitor[0], "rb") if args.monitor else None
-        out = open(args.outview[0], "rb") if args.outview else None
-        df, x = procesar_monitor_outview(mon, out, factores=None, outview_factor=None)
-        print(df.head(3))
-        if args.out_xlsx:
-            Path(args.out_xlsx).write_bytes(x.getvalue())
