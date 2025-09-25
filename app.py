@@ -1,4 +1,4 @@
-# app.py — SiReset (Streamlit) con worker a prueba de fallos
+# app.py — SiReset (Streamlit) con worker a prueba de fallos (fix: no tocar key del uploader en callbacks)
 from __future__ import annotations
 
 import os
@@ -39,19 +39,16 @@ except Exception:
 
 # ───────────────────── Imports de auth y core robustos ───────────────────────
 def _import_mougli_core():
-    # 1) core.mougli_core
     try:
         import core.mougli_core as mc
         return mc, "pkg"
     except Exception as e1:
         err1 = f"core.mougli_core: {e1}"
-    # 2) mougli_core (si core/ está en sys.path)
     try:
         import mougli_core as mc
         return mc, "flat"
     except Exception as e2:
         err2 = f"mougli_core: {e2}"
-    # 3) Carga por ruta
     try:
         from importlib.machinery import SourceFileLoader
         mod_path = CORE_DIR / "mougli_core.py"
@@ -90,7 +87,6 @@ except Exception as e:
     st.error(f"No pude importar el módulo de autenticación (auth.py): {e}")
     st.stop()
 
-# Resolver funciones/exportaciones del core
 def require_any(preferido: str, *alternativos: str):
     candidatos = (preferido, *alternativos)
     for name in candidatos:
@@ -208,7 +204,6 @@ def _start_worker(job_dir: Path, mon_paths: List[Path], out_paths: List[Path],
     logf = job_dir / "job.log"
     outxlsx = job_dir / "SiReset_Mougli.xlsx"
 
-    # ¿Podemos usar -m core.mougli_core? (solo si core/ es paquete)
     core_pkg_ok = (CORE_DIR / "__init__.py").exists() and (CORE_DIR / "mougli_core.py").exists()
     if core_pkg_ok:
         base_cmd = [sys.executable, "-m", "core.mougli_core"]
@@ -233,7 +228,6 @@ def _start_worker(job_dir: Path, mon_paths: List[Path], out_paths: List[Path],
         args.extend(["--outview", str(p)])
 
     Popen(args, cwd=str(APP_ROOT))
-
     progress.write_text(json.dumps({"status": "running", "step": 0, "total": 6, "message": "Inicializando…"}), encoding="utf-8")
 
 def _read_progress(job_dir: Path) -> Dict:
@@ -268,13 +262,11 @@ if not user:
     login_ui()
     st.stop()
 
-# Sidebar: saludo + logout
 with st.sidebar:
     st.markdown(f"**Usuario:** {user.get('name') or user.get('email', '—')}")
     st.markdown(f"**Rol:** {user.get('role', '—')}")
     logout_button()
 
-# ------------------- Apps permitidas por usuario -------------------
 mods = [str(m).lower() for m in (user.get("modules") or [])]
 allowed: List[str] = []
 if "mougli" in mods:
@@ -289,7 +281,6 @@ if not allowed:
     st.warning("Tu usuario no tiene módulos habilitados. Pide acceso a un administrador.")
     st.stop()
 
-# ---------- Sidebar: selector de app ----------
 app = st.sidebar.radio("Elige aplicación", allowed, index=0)
 
 # ---------- Factores SOLO visibles en Mougli ----------
@@ -355,8 +346,11 @@ if app == "Mougli":
             st.error(f"El worker reportó un error: {prog.get('message')}")
         st.stop()
 
-    # ---------- Staging: subir → volcar a disco inmediatamente ----------
-    MAX_PREVIEW_BYTES = 15 * 1024 * 1024  # 15 MB
+    # ---------- Estado para nonces de uploaders ----------
+    if "m_nonce" not in st.session_state:
+        st.session_state["m_nonce"] = 0
+    if "o_nonce" not in st.session_state:
+        st.session_state["o_nonce"] = 0
 
     def _ensure_pending_job():
         jid = st.session_state.get("pending_job_id")
@@ -370,53 +364,53 @@ if app == "Mougli":
     def _stage_files(kind: str, files):
         if not files:
             return []
-        jid, job_dir = _ensure_pending_job()
-        paths = _save_upload_to(job_dir, files, kind)
-        # Limpia los bytes del uploader para liberar RAM
-        key = "m_txt_multi" if kind == "monitor" else "o_multi"
-        try:
-            st.session_state[key] = None
-        except Exception:
-            pass
-        del files
-        gc.collect()
-        return paths
+        _, job_dir = _ensure_pending_job()
+        return _save_upload_to(job_dir, files, kind)
 
-    def _on_upload_monitor():
-        files = st.session_state.get("m_txt_multi") or []
+    # ---------- Callbacks (NO tocan el key del widget) ----------
+    def _on_upload_monitor(u_key: str):
+        files = st.session_state.get(u_key) or []
         _stage_files("monitor", files)
+        st.session_state["m_nonce"] += 1  # fuerza un nuevo key → uploader vacío
+        st.rerun()
 
-    def _on_upload_out():
-        files = st.session_state.get("o_multi") or []
+    def _on_upload_out(u_key: str):
+        files = st.session_state.get(u_key) or []
         _stage_files("outview", files)
+        st.session_state["o_nonce"] += 1
+        st.rerun()
 
-    # ---------- Carga con callbacks (stream to disk) ----------
+    # ---------- Carga con keys únicos por nonce ----------
     colL, colR = st.columns(2)
     with colL:
         st.caption("Sube Monitor (.txt) — puedes subir varios (se guardan inmediatamente)")
+        m_key = f"m_txt_multi__{st.session_state['m_nonce']}"
         st.file_uploader(
             "Arrastra y suelta aquí",
             type=["txt"],
-            key="m_txt_multi",
+            key=m_key,
             label_visibility="collapsed",
             accept_multiple_files=True,
             on_change=_on_upload_monitor,
+            args=(m_key,),
         )
     with colR:
         st.caption("Sube OutView (.csv / .xlsx) — puedes subir varios (se guardan inmediatamente)")
+        o_key = f"o_multi__{st.session_state['o_nonce']}"
         st.file_uploader(
             "Arrastra y suelta aquí",
             type=["csv", "xlsx"],
-            key="o_multi",
+            key=o_key,
             label_visibility="collapsed",
             accept_multiple_files=True,
             on_change=_on_upload_out,
+            args=(o_key,),
         )
 
     # ---------- Mostrar bandeja de archivos ya volcados a disco ----------
     jid = st.session_state.get("pending_job_id")
-    mon_paths = []
-    out_paths = []
+    mon_paths: List[Path] = []
+    out_paths: List[Path] = []
     if jid:
         job_dir = JOBS_DIR / jid
         mon_paths = sorted((job_dir / "uploads" / "monitor").glob("*"))
@@ -453,7 +447,6 @@ if app == "Mougli":
             if jid:
                 _clear_job(jid)
                 st.session_state.pop("pending_job_id", None)
-                gc.collect()
                 st.rerun()
     with colBtns2:
         if st.button("🚀 Procesar (seguro, en background)", type="primary"):
@@ -464,7 +457,6 @@ if app == "Mougli":
                     _start_worker(JOBS_DIR / jid, mon_paths, out_paths, factores, out_factor)
                     st.session_state["job_id"] = jid
                     st.session_state.pop("pending_job_id", None)
-                    gc.collect()
                     st.success("Trabajo lanzado. Puedes seguir usando la app.")
                     st.rerun()
                 except Exception as e:
@@ -475,6 +467,8 @@ if app == "Mougli":
     st.markdown("---")
     st.markdown("### ¿Solo quieres un vistazo rápido sin procesar todo?")
     st.caption("Esto carga y muestra **solo resúmenes** para validar archivos (no genera Excel).")
+
+    MAX_PREVIEW_BYTES = 15 * 1024 * 1024  # 15 MB
 
     colPrevA, colPrevB = st.columns(2)
     with colPrevA:
@@ -555,7 +549,6 @@ elif app == "Admin" and is_admin:
     all_mods = [m["code"] for m in list_all_modules(enabled_only=False)]
     users = list_users()
 
-    # Listado y selección
     st.subheader("Usuarios")
     if not users:
         st.info("No hay usuarios registrados.")
@@ -564,7 +557,6 @@ elif app == "Admin" and is_admin:
 
     colA, colB = st.columns(2)
 
-    # ---- Crear nuevo ----
     with colA:
         st.markdown("### Crear usuario")
         with st.form("create_user_form"):
@@ -589,7 +581,6 @@ elif app == "Admin" and is_admin:
                 except Exception as e:
                     st.error(f"No se pudo crear: {e}")
 
-    # ---- Editar existente ----
     with colB:
         st.markdown("### Editar usuario")
         if idx != "(nuevo)…":
@@ -620,3 +611,4 @@ elif app == "Admin" and is_admin:
                         st.error(f"No se pudo actualizar: {e}")
             else:
                 st.info("Selecciona un usuario del listado para editar.")
+
