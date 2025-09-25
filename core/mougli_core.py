@@ -1,5 +1,5 @@
 # core/mougli_core.py
-# Mougli core + Worker CLI robusto
+# Mougli core + Worker CLI robusto y de baja memoria
 from __future__ import annotations
 
 import io
@@ -154,8 +154,10 @@ def _read_out_robusto(file) -> pd.DataFrame:
     def _fix_tarifa(df: pd.DataFrame) -> pd.DataFrame:
         if "Tarifa S/." in df.columns:
             s = df["Tarifa S/."].astype(str).str.strip()
-            s = s.str.replace(r"(?<=\d)\.(?=\d{3}(\D|$))", "", regex=True)  # quita punto miles
-            s = s.str.replace(",", ".", regex=False)                        # coma → punto
+            # 180.498 -> 180498
+            s = s.str.replace(r"(?<=\d)\.(?=\d{3}(\D|$))", "", regex=True)
+            # 180,50 -> 180.50
+            s = s.str.replace(",", ".", regex=False)
             df["Tarifa S/."] = pd.to_numeric(s, errors="coerce")
         return df
 
@@ -167,10 +169,12 @@ def _read_out_robusto(file) -> pd.DataFrame:
                 engine = "pyarrow"
             except Exception:
                 engine = None
+
             try:
                 file.seek(0)
             except Exception:
                 pass
+
             df = pd.read_csv(
                 file,
                 usecols=usecols_cb,
@@ -251,14 +255,40 @@ def _version_column(df: pd.DataFrame) -> str | None:
     return None
 
 
+def _hash_key(df: pd.DataFrame, cols: List[str]) -> pd.Series:
+    """Hash 64-bit estable por fila sobre un subconjunto de columnas (memoria baja)."""
+    # Construye un DataFrame temporal con valores string o "" para columnas faltantes
+    tmp = {}
+    for c in cols:
+        if c in df.columns:
+            s = df[c]
+            # No materializamos en objetos gigantes: convertimos de forma ligera
+            s = s.astype("string").fillna("")
+        else:
+            s = pd.Series([""] * len(df), dtype="string")
+        tmp[c] = s
+    mini = pd.DataFrame(tmp)
+    return pd.util.hash_pandas_object(mini, index=False).astype("uint64")
+
+
+def _to_category(df: pd.DataFrame, cols: List[str]) -> None:
+    """Convierte in-place a 'category' si existe la columna (reduce RAM)."""
+    for c in cols:
+        if c in df.columns:
+            try:
+                df[c] = df[c].astype("category")
+            except Exception:
+                pass
+
+
 def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -> pd.DataFrame:
-    """Replica cálculos de OutView (incluye Tarifa Real $) usando claves hash para bajar RAM."""
+    """Replica cálculos de OutView (incluye Tarifa Real $) con uso de memoria reducido."""
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = df.copy()
 
-    # Fechas y derivados
+    # Normalización de fechas
     df["Fecha"] = pd.to_datetime(df.get("Fecha"), dayfirst=True, errors="coerce")
     df["AÑO"] = df["Fecha"].dt.year
     df["MES"] = df["Fecha"].dt.month.apply(lambda m: MESES_ES[int(m)] if pd.notnull(m) and 1 <= m <= 12 else "")
@@ -266,99 +296,118 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     df["_FechaDT"] = df["Fecha"]
     df["_YM"] = df["_FechaDT"].dt.to_period("M")
 
-    # Columnas categóricas para reducir memoria
-    cat_cols = [
-        "Proveedor","Tipo Elemento","Distrito","Avenida","Nro Calle/Cuadra","Orientación de Vía",
-        "Marca","NombreBase","Categoría","Anunciante","Sector","Región","Producto","Agencia",
-        "Item","Versión"
-    ]
-    for c in cat_cols:
-        if c in df.columns:
-            df[c] = df[c].astype("category")
-
     ver_col = _version_column(df)
 
-    # Helpers para obtener columnas con default vacío
-    def colv(c, default=""):
-        if c in df.columns:
-            return df[c]
-        return pd.Series([default] * len(df), index=df.index)
+    # ====== IDs internos por HASH (sin string gigante) ======
+    cols_unico = ["MES","AÑO","Latitud","Longitud","Avenida","Nro Calle/Cuadra","Marca",
+                  "Tipo Elemento","Orientación de Vía","Tarifa S/.","Proveedor","Distrito","Cod.Proveedor"]
+    cols_pieza = ["NombreBase","Proveedor","Tipo Elemento","Distrito","Orientación de Vía",
+                  "Nro Calle/Cuadra","Item", (ver_col or ""), "Latitud","Longitud","Categoría",
+                  "Tarifa S/.","Anunciante","MES","AÑO","SEMANA"]
+    cols_pieza = [c for c in cols_pieza if c]  # quita vacío si no hay ver_col
 
-    # === Claves hash internas (en vez de concatenar strings gigantes) ===
-    from pandas.util import hash_pandas_object
+    df["K_UNICO"] = _hash_key(df, cols_unico)
+    df["K_PIEZA"] = _hash_key(df, cols_pieza)
 
-    cu_cols = ["MES","AÑO","Latitud","Longitud","Avenida","Nro Calle/Cuadra","Marca",
-               "Tipo Elemento","Orientación de Vía","Tarifa S/.","Proveedor","Distrito","Cod.Proveedor"]
-    cu_frame = pd.DataFrame({c: colv(c) for c in cu_cols})
-    s_cu = pd.Series(hash_pandas_object(cu_frame, index=False).values, index=df.index, dtype="uint64")
+    # ====== Métricas base ======
+    df["Denominador"] = df.groupby("K_UNICO", observed=True, sort=False)["K_UNICO"].transform("size")
+    if ver_col and ver_col in df.columns:
+        # Conteo de versiones distintas por elemento
+        df["Q versiones por elemento"] = (
+            df[[ "K_UNICO", ver_col ]]
+              .groupby("K_UNICO", observed=True, sort=False)[ver_col]
+              .transform("nunique")
+        )
 
-    c1_cols = ["NombreBase","Proveedor","Tipo Elemento","Distrito","Orientación de Vía","Nro Calle/Cuadra",
-               "Item","Versión","Latitud","Longitud","Categoría","Tarifa S/.","Anunciante","MES","AÑO","SEMANA"]
-    c1_frame = pd.DataFrame({c: colv(c) for c in c1_cols})
-    s_c1 = pd.Series(hash_pandas_object(c1_frame, index=False).values, index=df.index, dtype="uint64")
+    # +1 superficie = cantidad de filas por K_PIEZA
+    df["+1 superficie"] = df.groupby("K_PIEZA", observed=True, sort=False)["K_PIEZA"].transform("size")
 
-    # === Métricas base (map en lugar de transform para ahorrar memoria) ===
-    df["Denominador"] = s_cu.map(s_cu.value_counts()).astype(int)
-    if ver_col:
-        nunq = df.groupby(s_cu, observed=False)[ver_col].nunique()
-        df["Q versiones por elemento"] = s_cu.map(nunq).astype("Int64")
+    tarifa_num = pd.to_numeric(df.get("Tarifa S/."), errors="coerce").fillna(0)
+    first_in_piece = (df.groupby("K_PIEZA", observed=True, sort=False).cumcount() == 0)
 
-    df["+1 superficie"] = s_c1.map(s_c1.value_counts()).astype(int)
-
-    tarifa_num = pd.to_numeric(df.get("Tarifa S/."), errors="coerce").fillna(0.0)
-    first_in_piece = (df.groupby(s_c1, observed=False).cumcount() == 0)
-
+    # TxS (interna)
     df["Tarifa × Superficie"] = np.where(first_in_piece, tarifa_num * df["+1 superficie"], 0.0)
     df["Tarifa × Superficie"] = (df["Tarifa × Superficie"] * float(factor_outview)) / 3.8
 
-    # Semana en mes + Conteo mensual
+    # Semana en mes por K_UNICO
     df["Semana en Mes por Código"] = (
-        df.groupby([s_cu, df["_YM"]], observed=False)["_FechaDT"]
-          .transform(lambda s: s.rank(method="dense").astype(int))
+        df.sort_values(["K_UNICO","_YM","_FechaDT"])
+          .groupby(["K_UNICO","_YM"], observed=True, sort=False)
+          .cumcount() + 1
     )
+    # Conteo mensual (visible: 1ra aparición del mes por K_UNICO)
     order_in_month = (
-        df.sort_values(["_FechaDT"])
-          .groupby([s_cu, df["_YM"]], observed=False).cumcount()
+        df.sort_values(["K_UNICO","_YM","_FechaDT"])
+          .groupby(["K_UNICO","_YM"], observed=True, sort=False)
+          .cumcount()
     )
     df["Conteo Mensual"] = (order_in_month == 0).astype(int)
 
-    # Inversión por código único
-    df_pieces = df[df["Tarifa × Superficie"] != 0]
-    per_first = df_pieces.groupby(s_cu.loc[df_pieces.index], observed=False)["Tarifa × Superficie"].first()
-    per_count = df_pieces.groupby(s_cu.loc[df_pieces.index], observed=False).size()
-    per_value = (per_first / per_count).astype(float)
-    df["Tarifa × Superficie (1ra por Código único)"] = s_cu.map(per_value)
+    # Inversión: primera TxS por K_UNICO / nº de piezas del K_UNICO
+    df_pieces = df[df["Tarifa × Superficie"] != 0].sort_values(["K_UNICO","_FechaDT"])
+    per_code_first = df_pieces.groupby("K_UNICO", observed=True, sort=False)["Tarifa × Superficie"].first()
+    per_code_count = df_pieces.groupby("K_UNICO", observed=True, sort=False)["Tarifa × Superficie"].size()
+    per_code_value = (per_code_first / per_code_count).astype(float)
+    df["Tarifa × Superficie (1ra por Código único)"] = df["K_UNICO"].map(per_code_value)
 
-    # === Conteos y sumas AB..AI / Z con hash (evita merges pesados) ===
-    # Conteo_AB_AI
-    ab_cols = ["Fecha","Proveedor","Tipo Elemento","Distrito","Avenida",
-               "Nro Calle/Cuadra","Orientación de Vía","Marca"]
-    ab_frame = pd.DataFrame({c: colv(c) for c in ab_cols})
-    k_ab = pd.Series(hash_pandas_object(ab_frame, index=False).values, index=df.index, dtype="uint64")
-    cnt_ab = k_ab.value_counts()
-    df["Conteo_AB_AI"] = k_ab.map(cnt_ab).astype(int)
-
-    # NB_EXTRAE_6_7
+    # ====== Columnas "Excel" (AB..AI y EXTRAE) — internas ======
     if "NombreBase" in df.columns:
-        df["NB_EXTRAE_6_7"] = df["NombreBase"].astype(str).str.slice(5, 12)
+        s_nb = df["NombreBase"].astype(str)
+        df["NB_EXTRAE_6_7"] = s_nb.str.slice(5, 12)
     else:
         df["NB_EXTRAE_6_7"] = ""
 
-    # Conteo_Z_AB_AI  y Suma_AM_Z_AB_AI
-    z_cols = ["NB_EXTRAE_6_7","Proveedor","Tipo Elemento","Distrito",
-              "Avenida","Nro Calle/Cuadra","Orientación de Vía","Marca"]
-    z_frame = pd.DataFrame({c: colv(c) for c in z_cols})
-    k_z = pd.Series(hash_pandas_object(z_frame, index=False).values, index=df.index, dtype="uint64")
-    cnt_z = k_z.value_counts()
-    df["Conteo_Z_AB_AI"] = k_z.map(cnt_z).astype(int)
+    def copy_or_empty(src, newname):
+        df[newname] = df[src] if src in df.columns else ""
 
+    copy_or_empty("Fecha", "Fecha_AB")
+    copy_or_empty("Proveedor", "Proveedor_AC")
+    copy_or_empty("Tipo Elemento", "TipoElemento_AD")
+    copy_or_empty("Distrito", "Distrito_AE")
+    copy_or_empty("Avenida", "Avenida_AF")
+    copy_or_empty("Nro Calle/Cuadra", "NroCalleCuadra_AG")
+    copy_or_empty("Orientación de Vía", "OrientacionVia_AH")
+    copy_or_empty("Marca", "Marca_AI")
+
+    # ====== Conteos tipo CONTAR.SI.CONJUNTO — internas (optimizado) ======
+    ab_ai_keys = ["Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
+                  "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
+    z_keys = ["NB_EXTRAE_6_7","Proveedor_AC","TipoElemento_AD","Distrito_AE",
+              "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI"]
+
+    _to_category(df, ab_ai_keys)
+    _to_category(df, z_keys)
+
+    counts = (
+        df.groupby(ab_ai_keys, dropna=False, observed=True, sort=False)
+          .size().reset_index(name="Conteo_AB_AI")
+    )
+    df = df.merge(counts, on=ab_ai_keys, how="left", copy=False)
+
+    counts2 = (
+        df.groupby(z_keys, dropna=False, observed=True, sort=False)
+          .size().reset_index(name="Conteo_Z_AB_AI")
+    )
+    df = df.merge(counts2, on=z_keys, how="left", copy=False)
+
+    # TarifaS/3 — interna de apoyo
     df["TarifaS_div3"] = tarifa_num / 3.0
-    df["TarifaS_div3_sobre_Conteo"] = df["TarifaS_div3"] / df["Conteo_AB_AI"].astype(float)
+    df["TarifaS_div3_sobre_Conteo"] = df["TarifaS_div3"] / pd.to_numeric(df["Conteo_AB_AI"], errors="coerce").astype(float)
 
-    sum_z = df.groupby(k_z, observed=False)["TarifaS_div3_sobre_Conteo"].sum()
-    df["Suma_AM_Z_AB_AI"] = k_z.map(sum_z).astype(float)
+    # SUMAR.SI.CONJUNTO — interna
+    sum_keys = ["NB_EXTRAE_6_7","Proveedor","Tipo Elemento","Distrito",
+                "Avenida","Nro Calle/Cuadra","Orientación de Vía","Marca"]
+    for c in sum_keys:
+        if c not in df.columns:
+            df[c] = ""
+    _to_category(df, sum_keys)
+    sums = (
+        df.groupby(sum_keys, dropna=False, observed=True, sort=False)["TarifaS_div3_sobre_Conteo"]
+          .sum().reset_index(name="Suma_AM_Z_AB_AI")
+    )
+    df = df.merge(sums, on=sum_keys, how="left", copy=False)
 
-    # Tope por Tipo
+    # Tope por Tipo — internas de apoyo
     tipo_to_base = {
         "BANDEROLA": 12000, "CLIP": 600, "MINIPOLAR": 1000, "PALETA": 600,
         "PANEL": 1825, "PANEL CARRETERO": 5000, "PANTALLA LED": 5400,
@@ -367,10 +416,11 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
     }
     tipo_up = df.get("Tipo Elemento", "").astype(str).str.upper()
     tope = tipo_up.map(tipo_to_base).astype(float) * (4.0/3.0)
-    an_val = pd.to_numeric(df["Suma_AM_Z_AB_AI"], errors="coerce")
     df["TopeTipo_AQ"] = tope
+    an_val = pd.to_numeric(df["Suma_AM_Z_AB_AI"], errors="coerce")
     df["Suma_AM_Topada_Tipo"] = np.where(np.isnan(tope), an_val, np.minimum(an_val, tope))
 
+    # División AO/AK y Tarifa Real ($) — visible
     denom = pd.to_numeric(df["Conteo_Z_AB_AI"], errors="coerce")
     df["SumaTopada_div_ConteoZ"] = np.where(
         denom > 0,
@@ -383,26 +433,28 @@ def _transform_outview_enriquecido(df: pd.DataFrame, *, factor_outview: float) -
         df["SumaTopada_div_ConteoZ"] * 0.8
     )
 
-    # Limpieza de columnas internas pesadas
-    drop_tmp = ["Tarifa × Superficie", "_FechaDT", "_YM"]
-    df.drop(columns=[c for c in drop_tmp if c in df.columns], inplace=True, errors="ignore")
+    # Limpiezas solicitadas globales (internas)
+    df.drop(columns=["Tarifa × Superficie"], inplace=True, errors="ignore")
+    if "Tarifa S/." in df.columns:
+        df.drop(columns=["Tarifa S/."], inplace=True, errors="ignore")
 
-    # Orden final
+    # Orden de columnas (base al inicio). Dejamos K_UNICO/K_PIEZA como internas.
     base = ["Fecha", "AÑO", "MES", "SEMANA"]
     tail = [
-        "Denominador",
+        "K_UNICO","K_PIEZA","Denominador",
         "Q versiones por elemento" if "Q versiones por elemento" in df.columns else None,
         "+1 superficie",
         "Tarifa × Superficie (1ra por Código único)",
         "Semana en Mes por Código","Conteo Mensual",
-        "NB_EXTRAE_6_7",
+        "NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD","Distrito_AE",
+        "Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI",
         "Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
         "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo",
         "SumaTopada_div_ConteoZ",
         "Tarifa Real ($)"
     ]
     tail = [c for c in tail if c]
-    cols = [*base] + [c for c in df.columns if c not in (*base, *tail)] + tail
+    cols = [*base] + [c for c in df.columns if c not in (*base, *tail, "_FechaDT", "_YM")] + tail
     return df[cols].copy()
 
 
@@ -511,10 +563,12 @@ def _write_sheet_with_header_and_table(writer: pd.ExcelWriter, *,
     header_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
     ws = writer.sheets[sheet_name]
 
+    # Altura fija por defecto (no auto-ajustar)
     ws.set_default_row(15)
     ws.set_row(0, 15)
     ws.set_row(1, 15)
 
+    # Datos como tabla
     start_row = len(header_df) + 2
     df = df.copy()
     df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
@@ -563,7 +617,7 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
     else:
         df_c = pd.DataFrame()
 
-    # OutView para Excel/vista pública: ocultar internas
+    # OutView para Excel/vista pública: ocultar internas (incluye K_UNICO/K_PIEZA)
     internal_targets = {
         "código único","código +1 pieza","denominador",
         "tarifa × superficie","tarifa × superficie (1ra por código único)",
@@ -571,7 +625,8 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
         "nb_extrae_6_7","fecha_ab","proveedor_ac","tipoelemento_ad","distrito_ae",
         "avenida_af","nrocallecuadra_ag","orientacionvia_ah","marca_ai",
         "conteo_ab_ai","conteo_z_ab_ai","tarifas_div3","tarifas_div3_sobre_conteo",
-        "suma_am_z_ab_ai","topetipo_aq","suma_am_topada_tipo","sumatopada_div_conteoz"
+        "suma_am_z_ab_ai","topetipo_aq","suma_am_topada_tipo","sumatopada_div_conteoz",
+        "k_unico","k_pieza"
     }
     def _norm(s: str) -> str: return str(s).strip().casefold()
     drop_cols = [c for c in df_o.columns if _norm(c) in internal_targets]
@@ -600,13 +655,14 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
             )
             _write_sheet_with_header_and_table(w, sheet_name="OutView", df=df_o_public, header_rows=hdr_o)
 
-        if not df_c.empty:
+        if not df_c.empty:  # solo si hay ambas
             d1, d2 = _date_range(df_c, ["FECHA"])
             hdr_c = [("Filas", len(df_c)),
                      ("Rango de fechas", f"{d1} - {d2}" if d1 and d2 else ""),
                      ("Fuentes incluidas", "Monitor + OutView")]
             _write_sheet_with_header_and_table(w, sheet_name="Consolidado", df=df_c, header_rows=hdr_c)
 
+        # Ajuste visual global
         wb = w.book
         fmt = wb.add_format({"valign": "vcenter"})
         for sh in ("Monitor", "OutView", "Consolidado"):
@@ -616,6 +672,7 @@ def procesar_monitor_outview(monitor_file, out_file, factores: Dict[str, float] 
                 ws.set_column(1, 60, 18, fmt)
 
     xlsx.seek(0)
+    # Resultado principal para vista previa:
     if not df_c.empty:
         df_result = df_c
     elif not df_m.empty:
@@ -651,6 +708,7 @@ def _xlsx_to_csv_stream(xlsx_path: Path, csv_writer: csv.writer) -> None:
     try:
         from openpyxl import load_workbook
     except Exception:
+        # Fallback: intenta con pandas (puede usar más memoria)
         df = pd.read_excel(xlsx_path, engine="openpyxl")
         for i, row in enumerate(df.itertuples(index=False, name=None)):
             if i == 0:
@@ -693,6 +751,7 @@ def _combine_outview_to_csv(inputs: List[Path], out_csv: Path):
         for p in inputs:
             name = p.name.lower()
             if name.endswith(".csv"):
+                # Stream de CSV en chunks, saltando cabeceras repetidas
                 with p.open("r", encoding="utf-8", errors="ignore", newline="") as f_in:
                     reader = csv.reader(f_in)
                     for i, row in enumerate(reader):
@@ -702,6 +761,7 @@ def _combine_outview_to_csv(inputs: List[Path], out_csv: Path):
                             wrote_header = True
                         writer.writerow(row)
             else:
+                # XLSX -> CSV por streaming
                 if not wrote_header:
                     pass
                 _xlsx_to_csv_stream(p, writer)
@@ -717,6 +777,7 @@ def worker_run(args):
         total_steps = 6
         _progress(progress, "running", 0, total_steps, "Inicializando…")
 
+        # Combinar entradas
         mon_inputs = [Path(x) for x in (args.monitor or []) if x]
         out_inputs = [Path(x) for x in (args.outview or []) if x]
         job_dir = Path(args.job_dir) if args.job_dir else outxlsx.parent
@@ -736,6 +797,7 @@ def worker_run(args):
             _log_append(logf, f"OutView combinado en {comb_out}")
         step += 1
 
+        # Procesar con la misma lógica de UI
         _progress(progress, "running", step, total_steps, "Procesando cálculos…")
         factores = json.loads(args.factores_json) if args.factores_json else load_monitor_factors()
         out_factor = float(args.outview_factor) if args.outview_factor else load_outview_factor()
@@ -761,6 +823,7 @@ def worker_run(args):
         step += 1
         _progress(progress, "done", step, total_steps, "Completado")
         _log_append(logf, f"Éxito: {outxlsx}")
+
         gc.collect()
 
     except Exception as e:
