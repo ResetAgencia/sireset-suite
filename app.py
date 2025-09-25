@@ -1,61 +1,79 @@
-# app.py — SiReset (Streamlit)
-# ✅ “A prueba de balas”: preview ligera; escritura Excel por trozos; errores visibles.
-
-import gc
+# app.py — SiReset (Streamlit) con procesamiento SEGURO (worker + logs + fallbacks)
+# Copiar y reemplazar.
+import os
+import sys
+import json
+import time
+import uuid
+import shutil
+import inspect
+import traceback
 from io import BytesIO
 from pathlib import Path
-import sys
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
 
 import pandas as pd
 import streamlit as st
+from subprocess import Popen
 
-# Mostrar detalles de error en la UI
-st.set_option('client.showErrorDetails', True)
-
-# --- Compatibilidad: experimental_rerun -> rerun ---
+# ---- Compat: experimental_rerun -> rerun ----
 if not hasattr(st, "experimental_rerun"):
     def experimental_rerun():
         st.rerun()
     st.experimental_rerun = experimental_rerun  # type: ignore
 
-# ---- auth imports ----
-try:
-    from auth import (
-        login_ui, current_user, logout_button,
-        list_users, create_user, update_user, set_password, list_all_modules,
-        DB_PATH as AUTH_DB_PATH,
-    )
-except Exception as e:
-    st.error(f"No pude importar el módulo de autenticación (auth.py): {e}")
-    st.stop()
+# ───────────────────── Panic-guard: muestra traza si algo truena al arrancar ──
+st.set_option('client.showErrorDetails', True)
+def _excepthook(exc_type, exc, tb):
+    try:
+        st.set_page_config(page_title="SiReset", layout="wide")
+    except Exception:
+        pass
+    st.error("Fallo crítico al iniciar la app.")
+    st.code("".join(traceback.format_exception(exc_type, exc, tb)))
+    try:
+        st.stop()
+    except Exception:
+        pass
+sys.excepthook = _excepthook
 
-# ---------- Config general ----------
-st.set_page_config(page_title="SiReset", layout="wide")
-try:
-    st.image("assets/Encabezado.png", use_container_width=True)
-except Exception:
-    pass
-
-# --- asegurar import de 'core'
+# ───────────────────── PATHS ─────────────────────
 APP_ROOT = Path(__file__).parent.resolve()
 for p in (APP_ROOT, APP_ROOT / "core"):
     sp = str(p)
     if sp not in sys.path:
         sys.path.insert(0, sp)
 
-# --- Importar mougli_core (módulo completo) y resolver símbolos
+# ───────────────────── Imports del core/auth ─────────────────────
 try:
     import core.mougli_core as mc
 except Exception as e:
-    st.error(
-        "No pude importar core.mougli_core. Verifica que exista la carpeta *core/* al lado de app.py "
-        "y que dentro esté mougli_core.py.\n\n"
-        f"Detalle técnico: {e}"
-    )
+    st.error("No pude importar core.mougli_core:\n\n" + str(e))
     st.stop()
 
+try:
+    from auth import (
+        login_ui, current_user, logout_button,
+        list_users, create_user, update_user, set_password, list_all_modules,
+        _connect as _db_connect  # para probar ruta de DB
+    )
+    def _db_path():
+        try:
+            con = _db_connect()
+            return con.execute("PRAGMA database_list;").fetchone()["file"]
+        except Exception:
+            return "(ruta no disponible)"
+finally:
+    pass
 
+# ───────────────────── Config general ─────────────────────
+st.set_page_config(page_title="SiReset", layout="wide")
+try:
+    st.image("assets/Encabezado.png", use_container_width=True)
+except Exception:
+    pass
+
+# ───────────────────── Resolver funciones del core ─────────────────────
 def require_any(preferido: str, *alternativos: str):
     candidatos = (preferido, *alternativos)
     for name in candidatos:
@@ -72,9 +90,7 @@ def require_any(preferido: str, *alternativos: str):
     )
     st.stop()
 
-
-# Resolver funciones/exportaciones de mougli_core
-procesar_monitor_outview = require_any("procesar_monitor_outview", "procesar_monitor_outview_v2", "procesar_outview_monitor")
+procesar_monitor_outview = require_any("procesar_monitor_outview")
 resumen_mougli = require_any("resumen_mougli")
 _read_monitor_txt = require_any("_read_monitor_txt")
 _read_out_robusto = require_any("_read_out_robusto")
@@ -83,29 +99,18 @@ save_monitor_factors = require_any("save_monitor_factors")
 load_outview_factor = require_any("load_outview_factor")
 save_outview_factor = require_any("save_outview_factor")
 
-# --------- Helpers y constantes ---------
-BAD_TIPOS = {"INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
-             "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"}
-
-HIDE_OUT_PREVIEW = {
-    "Código único","Denominador","Código +1 pieza","Tarifa × Superficie",
-    "Semana en Mes por Código","NB_EXTRAE_6_7","Fecha_AB","Proveedor_AC","TipoElemento_AD",
-    "Distrito_AE","Avenida_AF","NroCalleCuadra_AG","OrientacionVia_AH","Marca_AI",
-    "Conteo_AB_AI","Conteo_Z_AB_AI","TarifaS_div3","TarifaS_div3_sobre_Conteo",
-    "Suma_AM_Z_AB_AI","TopeTipo_AQ","Suma_AM_Topada_Tipo","SumaTopada_div_ConteoZ",
-}
-
-HEAVY_BYTES = 180 * 1024 * 1024
-HEAVY_ROWS_PREVIEW = 300_000
-MAX_PREVIEW_ROWS = 1_000
-
-
+# ───────────────────── Helpers UI ─────────────────────
 def _unique_list_str(series, max_items=50):
     if series is None:
         return "—"
     vals = (
-        series.astype(str).str.strip().replace({"nan": ""}).dropna()
-        .loc[lambda s: s.str.len() > 0].unique().tolist()
+        series.astype(str)
+        .str.strip()
+        .replace({"nan": ""})
+        .dropna()
+        .loc[lambda s: s.str.len() > 0]
+        .unique()
+        .tolist()
     )
     if not vals:
         return "—"
@@ -114,18 +119,15 @@ def _unique_list_str(series, max_items=50):
         return ", ".join(vals[:max_items]) + f" … (+{len(vals)-max_items} más)"
     return ", ".join(vals)
 
-
 def _web_resumen_enriquecido(df: Optional[pd.DataFrame], *, es_monitor: bool) -> pd.DataFrame:
     base = resumen_mougli(df, es_monitor=es_monitor) if df is not None else None
     if base is None or base.empty:
         base = pd.DataFrame([{"Filas": 0, "Rango de fechas": "—", "Marcas / Anunciantes": 0}])
     base_vertical = pd.DataFrame({"Descripción": base.columns, "Valor": base.iloc[0].tolist()})
-
     cat_col = "CATEGORIA" if es_monitor else ("Categoría" if (df is not None and "Categoría" in df.columns) else None)
     reg_col = "REGION/ÁMBITO" if es_monitor else ("Región" if (df is not None and "Región" in df.columns) else None)
     tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
     tipo_col = next((c for c in tipo_cols if (df is not None and c in df.columns)), None)
-
     extras_rows = []
     if df is not None and not df.empty:
         if cat_col:
@@ -134,17 +136,18 @@ def _web_resumen_enriquecido(df: Optional[pd.DataFrame], *, es_monitor: bool) ->
             extras_rows.append({"Descripción": "Regiones (únicas)", "Valor": _unique_list_str(df[reg_col])})
         if tipo_col:
             extras_rows.append({"Descripción": "Tipos de elemento (únicos)", "Valor": _unique_list_str(df[tipo_col])})
-
     if extras_rows:
         base_vertical = pd.concat([base_vertical, pd.DataFrame(extras_rows)], ignore_index=True)
-
     return base_vertical
-
 
 def _scan_alertas(df: Optional[pd.DataFrame], *, es_monitor: bool) -> List[str]:
     if df is None or df.empty:
         return []
     alerts = []
+    BAD_TIPOS = {
+        "INSERT", "INTERNACIONAL", "OBITUARIO", "POLITICO",
+        "AUTOAVISO", "PROMOCION CON AUSPICIO", "PROMOCION SIN AUSPICIO"
+    }
     tipo_cols = ["TIPO ELEMENTO", "TIPO", "Tipo Elemento"]
     tipo_col = next((c for c in tipo_cols if c in df.columns), None)
     if tipo_col:
@@ -160,125 +163,95 @@ def _scan_alertas(df: Optional[pd.DataFrame], *, es_monitor: bool) -> List[str]:
             alerts.append("Regiones distintas de LIMA detectadas: " + ", ".join(fuera))
     return alerts
 
-
-def _read_out_file_to_df(upload) -> pd.DataFrame:
-    name = (getattr(upload, "name", "") or "").lower()
+def llamar_procesar_monitor_outview(monitor_file, out_file, factores, outview_factor):
     try:
-        upload.seek(0)
-    except Exception:
-        pass
-    try:
-        if name.endswith(".csv"):
-            try:
-                return pd.read_csv(upload)
-            except UnicodeDecodeError:
-                upload.seek(0)
-                return pd.read_csv(upload, sep=";", encoding="latin-1")
-        return pd.read_excel(upload)
-    except Exception:
+        sig = inspect.signature(procesar_monitor_outview).parameters
+        if "outview_factor" in sig:
+            return procesar_monitor_outview(monitor_file, out_file, factores=factores, outview_factor=outview_factor)
+        else:
+            return procesar_monitor_outview(monitor_file, out_file, factores=factores)
+    except TypeError:
         try:
-            upload.seek(0)
-            return pd.read_csv(upload, sep=";", encoding="latin-1")
-        except Exception:
-            return pd.DataFrame()
+            return procesar_monitor_outview(monitor_file, out_file, factores, outview_factor)
+        except TypeError:
+            return procesar_monitor_outview(monitor_file, out_file, factores)
 
+# ───────────────────── Job Manager (subproceso + archivos) ────────────────────
+JOBS_DIR = Path(os.environ.get("SIRESET_JOBS_DIR", "/tmp/sireset_jobs")).resolve()
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-def combinar_monitor_txt(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
-    if not files:
-        return None, None
-    buf = BytesIO()
-    for i, f in enumerate(files):
-        data = f.getvalue()
-        if i > 0:
-            buf.write(b"\n")
-        buf.write(data)
-    buf.seek(0)
+def _new_job_dir() -> Path:
+    jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
+    d = JOBS_DIR / jid
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _save_upload(upload, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(upload.getvalue())
+
+def _start_worker(job_dir: Path, monitor_file, out_file, factores: Dict[str, float], out_factor: float):
+    progress = job_dir / "progress.json"
+    logf = job_dir / "job.log"
+    outxlsx = job_dir / "SiReset_Mougli.xlsx"
+    args = [
+        sys.executable, "-m", "core.mougli_core", "--as-worker",
+        "--out-xlsx", str(outxlsx),
+        "--progress", str(progress),
+        "--log", str(logf),
+        "--factores-json", json.dumps(factores),
+        "--outview-factor", str(out_factor)
+    ]
+    if monitor_file:
+        args.extend(["--monitor", str(monitor_file)])
+    if out_file:
+        args.extend(["--outview", str(out_file)])
+    # Lanzar subproceso en background
+    Popen(args, cwd=str(APP_ROOT))
+
+def _read_json_safe(p: Path) -> Dict:
     try:
-        setattr(buf, "name", "monitor_combined.txt")
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        pass
-    df_m = None
-    try:
-        buf.seek(0)
-        df_m = _read_monitor_txt(buf)
-        buf.seek(0)
-    except Exception:
-        df_m = None
-    return buf, df_m
+        return {}
 
+def _job_status(job_dir: Path) -> Dict:
+    return _read_json_safe(job_dir / "progress.json")
 
-def combinar_outview(files) -> Tuple[Optional[BytesIO], Optional[pd.DataFrame]]:
-    if not files:
-        return None, None
-    dfs = []
-    for f in files:
-        df = _read_out_file_to_df(f)
-        if df is not None and not df.empty:
-            dfs.append(df)
-    if not dfs:
-        return None, None
-    dfc = pd.concat(dfs, ignore_index=True)
-    out = BytesIO()
-    dfc.to_csv(out, index=False)
-    out.seek(0)
-    try:
-        setattr(out, "name", "outview_combined.csv")
-    except Exception:
-        pass
-    return out, dfc
+def _job_log(job_dir: Path, tail:int = 120) -> str:
+    p = job_dir / "job.log"
+    if not p.exists():
+        return ""
+    txt = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    return "\n".join(txt[-tail:])
 
-
-def _preview_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    normalized_hide = {c.strip().lower() for c in HIDE_OUT_PREVIEW}
-    cols_to_drop = [c for c in df.columns if c and c.strip().lower() in normalized_hide]
-    if cols_to_drop:
-        return df.drop(columns=cols_to_drop, errors="ignore").copy()
-    return df.copy()
-
-
-def _size_of_uploads(files) -> int:
-    total = 0
-    for f in files or []:
-        try:
-            total += getattr(f, "size", 0) or len(f.getvalue())
-        except Exception:
-            pass
-    return total
-
-
-# ------------------- LOGIN (obligatorio) -------------------
+# ───────────────────── LOGIN obligatorio ─────────────────────
 user = current_user()
 if not user:
     login_ui()
     st.stop()
 
-# Sidebar: saludo + logout
 with st.sidebar:
     st.markdown(f"**Usuario:** {user.get('name') or user.get('email', '—')}")
     st.markdown(f"**Rol:** {user.get('role', '—')}")
     logout_button()
 
-# ------------------- Apps permitidas por usuario -------------------
+# ───────────────────── Apps permitidas ─────────────────────
 mods = [str(m).lower() for m in (user.get("modules") or [])]
 allowed: List[str] = []
-if "mougli" in mods:
-    allowed.append("Mougli")
-if "mapito" in mods:
-    allowed.append("Mapito")
+if "mougli" in mods: allowed.append("Mougli")
+if "mapito"  in mods: allowed.append("Mapito")
 is_admin = (user.get("role") == "admin")
-if is_admin:
-    allowed.append("Admin")
-
+if is_admin: allowed.append("Admin")
 if not allowed:
     st.warning("Tu usuario no tiene módulos habilitados. Pide acceso a un administrador.")
     st.stop()
 
-# ---------- Sidebar: selector de app ----------
+# ───────────────────── Sidebar: selector ─────────────────────
 app = st.sidebar.radio("Elige aplicación", allowed, index=0)
 
-# ---------- Factores SOLO visibles en Mougli ----------
+# ───────────────────── Factores (solo Mougli) ─────────────────────
 if app == "Mougli":
     st.sidebar.markdown("### Factores")
     persist_m = load_monitor_factors()
@@ -298,109 +271,151 @@ if app == "Mougli":
         save_outview_factor(out_factor)
         st.sidebar.success("Factores guardados.")
 
-# =============== M O U G L I ===============
+# ───────────────────── M O U G L I ─────────────────────
 if app == "Mougli":
-    st.markdown("## Mougli – Monitor & OutView")
+    st.markdown("## Mougli — modo seguro (worker)")
 
+    # --- Cargar archivos (se guardan en disco del job) ---
     colL, colR = st.columns(2)
     with colL:
-        st.caption("Sube Monitor (.txt) — puedes subir varios")
+        st.caption("Sube Monitor (.txt) — opcional (varios)")
         up_monitor_multi = st.file_uploader(
             "Arrastra y suelta aquí", type=["txt"], key="m_txt_multi",
             label_visibility="collapsed", accept_multiple_files=True
         )
     with colR:
-        st.caption("Sube OutView (.csv / .xlsx) — puedes subir varios")
+        st.caption("Sube OutView (.csv / .xlsx) — opcional (varios)")
         up_out_multi = st.file_uploader(
             "Arrastra y suelta aquí", type=["csv", "xlsx"], key="o_multi",
             label_visibility="collapsed", accept_multiple_files=True
         )
 
-    total_bytes = _size_of_uploads(up_monitor_multi) + _size_of_uploads(up_out_multi)
-    heavy_upload = total_bytes > HEAVY_BYTES
-    if heavy_upload:
-        st.info("⚙️ Modo seguro activado por tamaño de archivos. La vista previa será limitada y la exportación optimizada.")
+    # Estado actual del job
+    if "job_dir" not in st.session_state:
+        st.session_state["job_dir"] = None
 
     st.write("")
-    if st.button("Procesar Mougli", type="primary"):
-        try:
-            with st.spinner("Procesando archivos..."):
-                mon_proc, df_m_res = combinar_monitor_txt(up_monitor_multi or [])
-                out_proc, df_o_res = combinar_outview(up_out_multi or [])
+    start = st.button("Procesar en modo SEGURO", type="primary")
 
-                df_result, xlsx = mc.procesar_monitor_outview(
-                    mon_proc, out_proc, factores=factores, outview_factor=out_factor
-                )
+    if start:
+        if not up_monitor_multi and not up_out_multi:
+            st.error("Sube al menos un archivo.")
+            st.stop()
 
-            st.success("¡Listo! ✅")
+        job_dir = _new_job_dir()
+        mon_path, out_path = None, None
 
-            colA, colB = st.columns(2)
-            with colA:
-                st.markdown("#### Monitor")
-                if df_m_res is None and mon_proc is not None:
-                    try:
-                        mon_proc.seek(0)
-                        df_m_res = _read_monitor_txt(mon_proc)
-                        mon_proc.seek(0)
-                    except Exception:
-                        df_m_res = None
-                st.dataframe(_web_resumen_enriquecido(df_m_res, es_monitor=True), use_container_width=True)
+        # Combinar y guardar Monitor
+        if up_monitor_multi:
+            mon_path = job_dir / "monitor_combined.txt"
+            with open(mon_path, "wb") as f:
+                for i, upl in enumerate(up_monitor_multi):
+                    if i > 0:
+                        f.write(b"\n")
+                    f.write(upl.getvalue())
 
-            with colB:
-                st.markdown("#### OutView")
-                if df_o_res is None and out_proc is not None:
-                    try:
-                        out_proc.seek(0)
-                        df_o_res = _read_out_robusto(out_proc)
-                        out_proc.seek(0)
-                    except Exception:
-                        df_o_res = None
-                st.dataframe(_web_resumen_enriquecido(df_o_res, es_monitor=False), use_container_width=True)
+        # Combinar y guardar OutView
+        if up_out_multi:
+            # Si vienen varios, los concateno a CSV (si .xlsx convierte a CSV básico)
+            out_path = job_dir / "outview_combined.csv"
+            first = True
+            with open(out_path, "wb") as fout:
+                for upl in up_out_multi:
+                    name = (upl.name or "").lower()
+                    if name.endswith(".csv"):
+                        fout.write(upl.getvalue() if first else upl.getvalue().split(b"\n",1)[-1])
+                        first = False
+                    else:
+                        # XLSX -> DataFrame -> CSV (sólo esta hoja)
+                        try:
+                            df_x = pd.read_excel(BytesIO(upl.getvalue()))
+                            if first:
+                                df_x.to_csv(fout, index=False, encoding="utf-8")
+                                first = False
+                            else:
+                                df_x.to_csv(fout, index=False, header=False, encoding="utf-8")
+                        except Exception:
+                            # Si no se puede, lo guardo aparte y paso esa ruta al worker
+                            out_path = job_dir / (Path(upl.name).stem + ".xlsx")
+                            _save_upload(upl, out_path)
 
-            issues: List[str] = []
-            issues += _scan_alertas(df_m_res, es_monitor=True)
-            issues += _scan_alertas(df_o_res, es_monitor=False)
-            if issues:
-                st.warning("⚠️ **Revisión sugerida antes de exportar**:\n\n- " + "\n- ".join(issues))
+        _start_worker(job_dir, mon_path, out_path, factores, out_factor)
+        st.session_state["job_dir"] = str(job_dir)
+        st.success(f"Trabajo iniciado: {job_dir.name}")
+        st.experimental_rerun()
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    "Descargar Excel (seguro)",
-                    data=xlsx.getvalue(),
-                    file_name="SiReset_Mougli.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-            with c2:
-                try:
-                    csv_data = (df_result or pd.DataFrame()).to_csv(index=False).encode("utf-8")
-                except Exception:
-                    csv_data = b""
-                st.download_button(
-                    "Descargar CSV (rápido)",
-                    data=csv_data,
-                    file_name="SiReset_Mougli.csv",
-                    mime="text/csv",
-                )
+    # Mostrar estado del job si existe
+    if st.session_state.get("job_dir"):
+        job_dir = Path(st.session_state["job_dir"])
+        st.info(f"Job actual: `{job_dir.name}`")
+        st.caption(f"Carpeta: {job_dir}")
 
-            st.markdown("### Vista previa")
-            rows = len(df_result) if df_result is not None else 0
-            if heavy_upload or rows > HEAVY_ROWS_PREVIEW:
-                st.info(f"Vista previa limitada por tamaño (filas totales: {rows:,}). Se muestran las primeras {MAX_PREVIEW_ROWS:,} filas.")
-                prev = _preview_df(df_result).head(MAX_PREVIEW_ROWS)
+        status = _job_status(job_dir)
+        logtxt = _job_log(job_dir)
+
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("#### Estado")
+            if not status:
+                st.write("⏳ Esperando progreso…")
             else:
-                prev = _preview_df(df_result).head(MAX_PREVIEW_ROWS)
-            st.dataframe(prev, use_container_width=True)
+                st.json(status)
+            st.button("Actualizar estado", on_click=lambda: st.experimental_rerun())
+        with colB:
+            st.markdown("#### Log")
+            st.code(logtxt or "(sin log por ahora)")
 
-            del prev, df_result, df_m_res, df_o_res
-            gc.collect()
+        if status.get("status") == "ok":
+            result_name = status.get("result")
+            result_type = status.get("result_type", "excel")
+            artifact = job_dir / result_name
+            if artifact.exists():
+                if result_type == "excel":
+                    with open(artifact, "rb") as f:
+                        st.download_button(
+                            "⬇️ Descargar Excel",
+                            data=f.read(),
+                            file_name=result_name,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="dl_excel"
+                        )
+                else:
+                    with open(artifact, "rb") as f:
+                        st.download_button(
+                            "⬇️ Descargar ZIP (CSV)",
+                            data=f.read(),
+                            file_name=result_name,
+                            mime="application/zip",
+                            key="dl_zip"
+                        )
+                # Vista previa (si cabe)
+                try:
+                    # Si el worker guardó parquet — opcional
+                    pv = job_dir / "preview.parquet"
+                    if pv.exists():
+                        import pyarrow.parquet as pq
+                        df_prev = pq.read_table(pv).to_pandas()
+                        st.markdown("### Vista previa")
+                        st.dataframe(df_prev.head(100), use_container_width=True)
+                except Exception:
+                    pass
 
-        except Exception as e:
-            st.error(f"Ocurrió un error procesando: {e}")
-            st.exception(e)
-            gc.collect()
+        elif status.get("status") == "error":
+            st.error("El procesamiento falló en el worker.")
+            if status.get("error"):
+                st.code(status["error"])
 
-# =============== M A P I T O ===============
+        # Limpieza
+        st.divider()
+        if st.button("🧹 Cerrar y limpiar este job"):
+            try:
+                shutil.rmtree(job_dir, ignore_errors=True)
+            except Exception:
+                pass
+            st.session_state["job_dir"] = None
+            st.experimental_rerun()
+
+# ───────────────────── M A P I T O ─────────────────────
 elif app == "Mapito":
     st.markdown("## Mapito – Perú")
     try:
@@ -432,13 +447,12 @@ elif app == "Mapito":
                 st.caption(f"Elementos mostrados: {len(seleccion)}")
         except Exception as e:
             st.error(f"No se pudo construir el mapa: {e}")
-            st.exception(e)
 
-# =============== A D M I N ===============
+# ───────────────────── A D M I N ─────────────────────
 elif app == "Admin" and is_admin:
     st.header("Administración de usuarios")
     try:
-        st.caption(f"📦 Base de datos: `{AUTH_DB_PATH}`")
+        st.caption(f"📦 Base de datos: `{_db_path()}`")
     except Exception:
         pass
 
@@ -476,7 +490,6 @@ elif app == "Admin" and is_admin:
                     st.experimental_rerun()
                 except Exception as e:
                     st.error(f"No se pudo crear: {e}")
-                    st.exception(e)
 
     with colB:
         st.markdown("### Editar usuario")
@@ -493,20 +506,12 @@ elif app == "Admin" and is_admin:
                     ok_edit = st.form_submit_button("Guardar cambios")
                 if ok_edit:
                     try:
-                        update_user(
-                            u["id"],
-                            name=e_name,
-                            role=e_role,
-                            active=e_active,
-                            modules=e_modules,
-                        )
+                        update_user(u["id"], name=e_name, role=e_role, active=e_active, modules=e_modules)
                         if e_newpwd:
                             set_password(u["id"], e_newpwd)
                         st.success("Cambios guardados.")
                         st.experimental_rerun()
                     except Exception as e:
                         st.error(f"No se pudo actualizar: {e}")
-                        st.exception(e)
-            else:
-                st.info("Selecciona un usuario del listado para editar.")
-
+        else:
+            st.info("Selecciona un usuario del listado para editar.")
